@@ -1,0 +1,165 @@
+# ==============================================================================
+# PHASE 4 — STAGE I SENSITIVITY VALIDATION PASS
+# Steps 4.1 to 4.3 — Tightened Cohort Testing & Confidence Tiering
+# ==============================================================================
+
+cat("\n--- Executing Phase 4: Stage I Sensitivity Validation Pass ---\n")
+
+library(parallel)
+library(doParallel)
+library(glmnet)
+library(data.table)
+
+# 4.1.1: Fetch active training registry for the Stage I restricted arm
+stage1_train_meta <- training_env$arm_stageI_only_train
+n_stage1_train <- nrow(stage1_train_meta)
+
+# Setup and register cluster for Stage I loops
+num_cores <- max(1, parallel::detectCores() - 2)
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+clusterExport(cl, varlist = c("mrna_sync", "mirna_sync", "met_sync", "cnv_sync", "rppa_sync", 
+                             "stage1_train_meta", "config", "n_stage1_train"))
+clusterEvalQ(cl, {
+  library(glmnet)
+  library(stats)
+})
+
+subsample_fraction <- 0.50
+n_subsample_s1 <- floor(n_stage1_train * subsample_fraction)
+
+cat(sprintf("Running 100 Real Bootstrap Folds on Stage I cohort (N Subsample: %d)...\n", n_subsample_s1))
+
+stage1_real_results <- foreach(fold = 1:100, .packages = c("glmnet")) %dopar% {
+  set.seed(config$seed + 10000 + fold)
+  
+  fold_samples <- sample(stage1_train_meta$sample_barcode_15, size = n_subsample_s1, replace = FALSE)
+  fold_meta <- stage1_train_meta[stage1_train_meta$sample_barcode_15 %in% fold_samples, ]
+  
+  # Within-Fold HVG Compression
+  mrna_vars <- apply(mrna_sync[, fold_samples, drop = FALSE], 1, var)
+  mrna_keep <- names(sort(mrna_vars, decreasing = TRUE))[1:min(5000, length(mrna_vars))]
+  
+  met_vars <- apply(met_sync[, fold_samples, drop = FALSE], 1, var)
+  met_keep := names(sort(met_vars, decreasing = TRUE))[1:min(5000, length(met_vars))]
+  
+  fold_x_matrix <- t(rbind(
+    mrna_sync[mrna_keep, fold_samples, drop = FALSE],
+    mirna_sync[, fold_samples, drop = FALSE],
+    met_sync[met_keep, fold_samples, drop = FALSE],
+    cnv_sync[, fold_samples, drop = FALSE],
+    rppa_sync[, fold_samples, drop = FALSE]
+  ))
+  
+  fold_y_vector <- ifelse(fold_meta$class == "Normal", 0, 1)
+  
+  w_normal <- length(fold_y_vector) / (2 * max(1, sum(fold_y_vector == 0)))
+  w_early  <- length(fold_y_vector) / (2 * max(1, sum(fold_y_vector == 1)))
+  sample_weights <- ifelse(fold_y_vector == 0, w_normal, w_early)
+  
+  fit_en <- tryCatch({
+    cv.glmnet(x = fold_x_matrix, y = fold_y_vector, weights = sample_weights,
+              family = "binomial", alpha = 0.50, standardize = TRUE)
+  }, error = function(e) { return(NULL) })
+  
+  if (is.null(fit_en)) return(character(0))
+  coef_1se <- coef(fit_en, s = "lambda.1se")
+  coef_vector <- as.vector(coef_1se)[-1]
+  names(coef_vector) <- rownames(coef_1se)[-1]
+  
+  return(names(coef_vector)[coef_vector != 0])
+}
+
+# 4.2.1: Run 100 Permuted Folds for Stage I Null Calibration
+cat("Running 100 Permuted Bootstrap Folds for Stage I Null Calibration...\n")
+
+stage1_perm_results <- foreach(fold = 1:100, .packages = c("glmnet")) %dopar% {
+  set.seed(config$seed + 15000 + fold)
+  
+  shuffled_meta <- stage1_train_meta
+  shuffled_meta$class <- sample(shuffled_meta$class)
+  
+  fold_samples <- sample(shuffled_meta$sample_barcode_15, size = n_subsample_s1, replace = FALSE)
+  fold_meta <- shuffled_meta[shuffled_meta$sample_barcode_15 %in% fold_samples, ]
+  
+  mrna_vars <- apply(mrna_sync[, fold_samples, drop = FALSE], 1, var)
+  mrna_keep <- names(sort(mrna_vars, decreasing = TRUE))[1:min(5000, length(mrna_vars))]
+  
+  met_vars <- apply(met_sync[, fold_samples, drop = FALSE], 1, var)
+  met_keep <- names(sort(met_vars, decreasing = TRUE))[1:min(5000, length(met_vars))]
+  
+  fold_x_matrix <- t(rbind(
+    mrna_sync[mrna_keep, fold_samples, drop = FALSE],
+    mirna_sync[, fold_samples, drop = FALSE],
+    met_sync[met_keep, fold_samples, drop = FALSE],
+    cnv_sync[, fold_samples, drop = FALSE],
+    rppa_sync[, fold_samples, drop = FALSE]
+  ))
+  
+  fold_y_vector <- ifelse(fold_meta$class == "Normal", 0, 1)
+  
+  w_normal <- length(fold_y_vector) / (2 * max(1, sum(fold_y_vector == 0)))
+  w_early  <- length(fold_y_vector) / (2 * max(1, sum(fold_y_vector == 1)))
+  sample_weights <- ifelse(fold_y_vector == 0, w_normal, w_early)
+  
+  fit_en <- tryCatch({
+    cv.glmnet(x = fold_x_matrix, y = fold_y_vector, weights = sample_weights,
+              family = "binomial", alpha = 0.50, standardize = TRUE)
+  }, error = function(e) { return(NULL) })
+  
+  if (is.null(fit_en)) return(character(0))
+  coef_1se <- coef(fit_en, s = "lambda.1se")
+  coef_vector <- as.vector(coef_1se)[-1]
+  names(coef_vector) <- rownames(coef_1se)[-1]
+  
+  return(names(coef_vector)[coef_vector != 0])
+}
+
+stopCluster(cl)
+
+# ------------------------------------------------------------------------------
+# Step 4.3: Cross-Reference frequencies & Tier Assignment
+# ------------------------------------------------------------------------------
+
+# Process Stage I frequencies
+all_s1_real_features <- unlist(stage1_real_results)
+s1_freq_table <- table(all_s1_real_features) / 100
+s1_freq_df <- data.frame(feature = names(s1_freq_table), stability_freq_stageI = as.numeric(s1_freq_table), stringsAsFactors = FALSE)
+
+all_s1_perm_features <- unlist(stage1_perm_results)
+if (length(all_s1_perm_features) > 0) {
+  s1_perm_table <- table(all_s1_perm_features) / 100
+  stageI_threshold <- max(0.20, min(0.60, as.numeric(quantile(s1_perm_table, 0.99))))
+} else {
+  stageI_threshold <- 0.15
+}
+
+# Load Phase 3 results for cross-referencing
+axis1_transformation <- readRDS(file.path(config$out_dir, "axis1_transformation_scored_summary.rds"))
+
+# Merge datasets
+tier_master_df <- axis1_transformation %>%
+  left_join(s1_freq_df, by = "feature") %>%
+  mutate(stability_freq_stageI = ifelse(is.na(stability_freq_stageI), 0, stability_freq_stageI))
+
+# Recover the Phase 3 threshold from original dataset parameters
+phase3_threshold_met <- tier_master_df$is_primary_candidate
+
+# Compute dynamic Tier classes
+tier_master_df <- tier_master_df %>%
+  mutate(
+    confidence_tier = case_when(
+      phase3_threshold_met & (stability_freq_stageI >= stageI_threshold) ~ "Tier A",
+      phase3_threshold_met & (stability_freq_stageI < stageI_threshold)  ~ "Tier B",
+      (!phase3_threshold_met) & (stability_freq_stageI >= stageI_threshold) ~ "Tier C",
+      TRUE ~ "Untiered"
+    )
+  )
+
+# Export the sensitivity analysis logs
+fwrite(tier_master_df, file = file.path(config$csv_dir, "axis1_stage1_sensitivity_weights.csv"))
+saveRDS(tier_master_df, file = file.path(config$out_dir, "axis1_stage1_sensitivity_scored_summary.rds"))
+
+cat("\n--- Sensitivity Tiering Allocation Finalized ---\n")
+print(table(tier_master_df$confidence_tier))
