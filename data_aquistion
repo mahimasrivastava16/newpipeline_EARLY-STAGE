@@ -1,0 +1,218 @@
+ ==============================================================================
+# SECTION 0: CONFIGURATION — Set all paths here
+# ==============================================================================
+
+config <- list(
+  # Input / output directories
+  raw_dir   = "data/raw",          # Where GDCdownload saves raw .rda files
+  out_dir   = "data/processed",    # Where processed .rda files are saved
+  plot_dir  = "results/plots/qc",  # QC plots
+  csv_dir   = "results/tables",    # Exported CSV tables
+
+  # External annotation files (download before running)
+  # Pidsley et al. 2016 cross-reactive probes:
+  #   https://static-content.springer.com/esm/art%3A10.1186%2Fs13059-016-1066-1/
+  #   MediaObjects/13059_2016_1066_MOESM1_ESM.csv
+  pidsley_file    = "data/annotations/pidsley_cross_reactive_probes.csv",
+
+  # TCGA RPPA antibody annotations (download from GDC):
+  #   https://gdc.cancer.gov/about-data/publications/pancanatlas
+  antibody_anno   = "data/annotations/TCGA_antibodies_descriptions.gencode.v36.tsv",
+
+  # Clinical metadata (generated after MOFA, or pre-prepared from TCGA clinical data)
+  clin_csv        = "data/clinical/common_samples_clinical.csv",
+
+  # GDC project
+  project         = "TCGA-BRCA",
+
+  # Reproducibility seed
+  seed            = 42L
+)
+
+# Create output directories
+for (d in c(config$raw_dir, config$out_dir, config$plot_dir, config$csv_dir)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+
+# ==============================================================================
+# SECTION 1: LIBRARIES
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(TCGAbiolinks)
+  library(DESeq2)
+  library(edgeR)
+  library(limma)
+  library(sva)
+  library(MOFA2)
+  library(SummarizedExperiment)
+  library(minfi)
+  library(wateRmelon)
+  library(impute)
+  library(preprocessCore)
+  library(miRBaseConverter)
+  library(org.Hs.eg.db)
+  library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  library(GenomicRanges)
+  library(tidyverse)
+  library(data.table)
+})
+
+# Record session information for reproducibility
+writeLines(capture.output(sessionInfo()),
+           file.path(config$out_dir, "sessionInfo.txt"))
+cat("Session info saved.\n")
+
+
+# ==============================================================================
+# SECTION 1A: HELPER FUNCTIONS
+# ==============================================================================
+
+#' Standardise TCGA barcodes to 15 characters (patient-aliquot level)
+standardize_barcodes <- function(barcodes) substr(barcodes, 1, 15)
+
+#' Extract plate ID from full TCGA barcode (positions 22-25) for batch correction
+get_plate_id <- function(barcodes) substr(barcodes, 22, 25)
+
+#' Save a tiff QC plot safely
+save_tiff <- function(path, expr, width = 6, height = 6, res = 300) {
+  tiff(path, width = width, height = height, units = "in", res = res)
+  tryCatch(force(expr), finally = dev.off())
+}
+
+
+# ==============================================================================
+# SECTION 2: GDC QUERY, DOWNLOAD, AND PREPARE
+# Skip this section if .rda files already exist in config$raw_dir
+# ==============================================================================
+
+## 2.1  Barcodes to exclude (known quality issues from prior QC)
+unwanted_barcodes <- c(
+  "TCGA-A2-A25A-01A-12R-A16F-07", "TCGA-LL-A440-01A-11R-A24H-07",
+  "TCGA-S3-AA17-01A-11R-A41B-07", "TCGA-GM-A2DO-01A-11R-A18M-07",
+  "TCGA-B6-A0RM-01A-11R-A084-07", "TCGA-AR-A0U1-01A-11R-A115-07",
+  "TCGA-A7-A0DC-01A-11R-A00Z-07", "TCGA-BH-A0B2-01A-11R-A10J-07"
+)
+unwanted_samples <- standardize_barcodes(unwanted_barcodes)
+
+## 2.2  Initial queries to identify common samples across modalities
+query_mrna <- GDCquery(
+  project               = config$project,
+  data.category         = "Transcriptome Profiling",
+  data.type             = "Gene Expression Quantification",
+  experimental.strategy = "RNA-Seq"
+)
+query_mirna <- GDCquery(
+  project       = config$project,
+  data.category = "Transcriptome Profiling",
+  data.type     = "Isoform Expression Quantification",
+  workflow.type = "BCGSC miRNA Profiling"
+)
+query_methyl <- GDCquery(
+  project       = config$project,
+  data.category = "DNA Methylation",
+  data.type     = "Methylation Beta Value",
+  platform      = "Illumina Human Methylation 450"
+)
+query_cnv <- GDCquery(
+  project       = config$project,
+  data.category = "Copy Number Variation",
+  data.type     = "Masked Copy Number Segment"
+)
+query_protein <- GDCquery(
+  project               = config$project,
+  data.category         = "Proteome Profiling",
+  data.type             = "Protein Expression Quantification",
+  experimental.strategy = "Reverse Phase Protein Array"
+)
+
+## 2.3  Intersect barcodes across all five modalities
+common_samples <- Reduce(intersect, list(
+  standardize_barcodes(getResults(query_mrna,    cols = "cases")),
+  standardize_barcodes(getResults(query_mirna,   cols = "cases")),
+  standardize_barcodes(getResults(query_methyl,  cols = "cases")),
+  standardize_barcodes(getResults(query_cnv,     cols = "cases")),
+  standardize_barcodes(getResults(query_protein, cols = "cases"))
+))
+common_samples <- sort(setdiff(common_samples, unwanted_samples))
+cat("Common samples after exclusions:", length(common_samples), "\n")
+
+## 2.4  Re-query restricted to common samples
+re_query <- function(q, barcodes) {
+  GDCquery(
+    project               = q$project,
+    data.category         = q$data.category,
+    data.type             = q$data.type,
+    experimental.strategy = q$experimental.strategy,
+    workflow.type         = q$workflow.type,
+    platform              = q$platform,
+    barcode               = barcodes
+  )
+}
+query_mrna    <- re_query(query_mrna,    common_samples)
+query_mirna   <- re_query(query_mirna,   common_samples)
+query_methyl  <- re_query(query_methyl,  common_samples)
+query_cnv     <- re_query(query_cnv,     common_samples)
+query_protein <- re_query(query_protein, common_samples)
+
+## 2.5  Download and prepare raw objects
+GDCdownload(query_mrna,    method = "api")
+GDCdownload(query_mirna,   method = "api")
+GDCdownload(query_methyl,  method = "api")
+GDCdownload(query_protein, method = "api")
+GDCdownload(query_cnv,     method = "api", files.per.chunk = 10)
+
+GDCprepare(query_mrna,    save = TRUE, save.filename = file.path(config$raw_dir, "RNA.rda"))
+GDCprepare(query_mirna,   save = TRUE, save.filename = file.path(config$raw_dir, "miRNA.rda"))
+GDCprepare(query_methyl,  save = TRUE, save.filename = file.path(config$raw_dir, "met.rda"))
+GDCprepare(query_protein, save = TRUE, save.filename = file.path(config$raw_dir, "prot.rda"))
+GDCprepare(query_cnv,     save = TRUE, save.filename = file.path(config$raw_dir, "cnv.rda"))
+
+# ==============================================================================
+# SECTION 2A: CLINICAL KEYING & REGISTER COMPILATION
+# Step 1.2 — Map clinical staging variables to the downloaded sample keys
+# ==============================================================================
+
+cat("\nCompiling Clinical Metadata Registries...\n")
+
+# Pull fresh core clinical indexes from the GDC via TCGAbiolinks
+clinical_data <- GDCquery_clinic(project = config$project, type = "clinical")
+
+# Build a working data frame matching your 15-character common_samples vector
+meta_matrix <- data.frame(
+  sample_barcode_15 = common_samples,
+  patient_id        = substr(common_samples, 1, 12),
+  sample_type_code  = substr(common_samples, 14, 15),
+  stringsAsFactors  = FALSE
+)
+
+# Merge GDC pathologic staging metadata back into our sample baseline pool
+meta_matrix <- meta_matrix %>%
+  left_join(
+    clinical_data %>% 
+      dplyr::select(submitter_id, ajcc_pathologic_stage, race, vital_status), 
+    by = c("patient_id" = "submitter_id")
+  ) %>%
+  rename(ajcc_stage = ajcc_pathologic_stage)
+
+# Assign strict pan-disease trajectory classification tags based on code layouts:
+# 11 = Solid Tissue Normal | 01 = Primary Solid Tumor
+meta_matrix <- meta_matrix %>%
+  mutate(
+    class = case_when(
+      sample_type_code == "11" ~ "Normal",
+      sample_type_code == "01" & ajcc_stage %in% c("Stage I", "Stage IA", "Stage IB", "Stage II", "Stage IIA", "Stage IIB") ~ "Early",
+      sample_type_code == "01" & ajcc_stage %in% c("Stage III", "Stage IIIA", "Stage IIIB", "Stage IIIC", "Stage IV") ~ "Late",
+      TRUE ~ "Excluded"
+    )
+  ) %>%
+  filter(class != "Excluded")
+
+# Save the unified registry out to your designated processed directory
+saveRDS(meta_matrix, file = file.path(config$out_dir, "synchronized_metadata_registry.rds"))
+
+cat("\n--- Registry Setup Confirmed ---\n")
+print(table(meta_matrix$class, useNA = "always"))
+
