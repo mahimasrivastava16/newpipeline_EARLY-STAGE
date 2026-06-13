@@ -1,0 +1,168 @@
+# ==============================================================================
+# PHASE 5 — PROGRESSION AXIS ENGINES (EARLY -> LATE STAGE)
+# Axis 2 — Global Pooled Progression Stability Selection
+# ==============================================================================
+
+cat("\n--- Executing Phase 5: Axis 2 Global Progression Engine ---\n")
+
+library(parallel)
+library(doParallel)
+library(glmnet)
+library(data.table)
+
+# 5.0.1: Extract active training registry for the progression arm
+progress_train_meta <- training_env$arm_progress_train
+n_progress_train <- nrow(progress_train_meta)
+
+# Setup and register core cluster for the progression axis
+num_cores <- max(1, parallel::detectCores() - 2)
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+clusterExport(cl, varlist = c("mrna_sync", "mirna_sync", "met_sync", "cnv_sync", "rppa_sync", 
+                             "progress_train_meta", "config", "n_progress_train"))
+clusterEvalQ(cl, {
+  library(glmnet)
+  library(stats)
+})
+
+subsample_fraction <- 0.50
+n_subsample_p2 <- floor(n_progress_train * subsample_fraction)
+
+cat(sprintf("Launching 100 Real Bootstrap Progression Folds (N Subsample: %d)...\n", n_subsample_p2))
+
+progress_real_results <- foreach(fold = 1:100, .packages = c("glmnet")) %dopar% {
+  set.seed(config$seed + 20000 + fold)
+  
+  fold_samples <- sample(progress_train_meta$sample_barcode_15, size = n_subsample_p2, replace = FALSE)
+  fold_meta <- progress_train_meta[progress_train_meta$sample_barcode_15 %in% fold_samples, ]
+  
+  # Within-Fold Leakproof HVG Compression (Top 5000 from active rows)
+  mrna_vars <- apply(mrna_sync[, fold_samples, drop = FALSE], 1, var)
+  mrna_keep <- names(sort(mrna_vars, decreasing = TRUE))[1:min(5000, length(mrna_vars))]
+  
+  met_vars <- apply(met_sync[, fold_samples, drop = FALSE], 1, var)
+  met_keep <- names(sort(met_vars, decreasing = TRUE))[1:min(5000, length(met_vars))]
+  
+  fold_x_matrix <- t(rbind(
+    mrna_sync[mrna_keep, fold_samples, drop = FALSE],
+    mirna_sync[, fold_samples, drop = FALSE],
+    met_sync[met_keep, fold_samples, drop = FALSE],
+    cnv_sync[, fold_samples, drop = FALSE],
+    rppa_sync[, fold_samples, drop = FALSE]
+  ))
+  
+  # Assign Staging Vector: Early (Stages I + II) = 0 | Late (Stages III + IV) = 1
+  fold_y_vector <- ifelse(fold_meta$class == "Early", 0, 1)
+  
+  # Fit unweighted binomial model (both progress classes are statistically substantial)
+  fit_en <- tryCatch({
+    cv.glmnet(x = fold_x_matrix, y = fold_y_vector,
+              family = "binomial", alpha = 0.50, standardize = TRUE)
+  }, error = function(e) { return(NULL) })
+  
+  if (is.null(fit_en)) return(character(0))
+  coef_1se <- coef(fit_en, s = "lambda.1se")
+  coef_vector <- as.vector(coef_1se)[-1]
+  names(coef_vector) <- rownames(coef_1se)[-1]
+  
+  selected_features <- names(coef_vector)[coef_vector != 0]
+  selected_directions <- sign(coef_vector[selected_features])
+  
+  list(features = selected_features, directions = selected_directions)
+}
+
+# 5.0.2: Run 100 Permuted Folds for Axis 2 Progression Null Calibration
+cat("Launching 100 Permuted Bootstrap Folds for Axis 2 Progression Null Calibration...\n")
+
+progress_perm_results <- foreach(fold = 1:100, .packages = c("glmnet")) %dopar% {
+  set.seed(config$seed + 25000 + fold)
+  
+  shuffled_meta <- progress_train_meta
+  shuffled_meta$class <- sample(shuffled_meta$class)
+  
+  fold_samples <- sample(shuffled_meta$sample_barcode_15, size = n_subsample_p2, replace = FALSE)
+  fold_meta <- shuffled_meta[shuffled_meta$sample_barcode_15 %in% fold_samples, ]
+  
+  mrna_vars <- apply(mrna_sync[, fold_samples, drop = FALSE], 1, var)
+  mrna_keep <- names(sort(mrna_vars, decreasing = TRUE))[1:min(5000, length(mrna_vars))]
+  
+  met_vars <- apply(met_sync[, fold_samples, drop = FALSE], 1, var)
+  met_keep <- names(sort(met_vars, decreasing = TRUE))[1:min(5000, length(met_vars))]
+  
+  fold_x_matrix <- t(rbind(
+    mrna_sync[mrna_keep, fold_samples, drop = FALSE],
+    mirna_sync[, fold_samples, drop = FALSE],
+    met_sync[met_keep, fold_samples, drop = FALSE],
+    cnv_sync[, fold_samples, drop = FALSE],
+    rppa_sync[, fold_samples, drop = FALSE]
+  ))
+  
+  fold_y_vector <- ifelse(fold_meta$class == "Early", 0, 1)
+  
+  fit_en <- tryCatch({
+    cv.glmnet(x = fold_x_matrix, y = fold_y_vector,
+              family = "binomial", alpha = 0.50, standardize = TRUE)
+  }, error = function(e) { return(NULL) })
+  
+  if (is.null(fit_en)) return(character(0))
+  coef_1se <- coef(fit_en, s = "lambda.1se")
+  coef_vector <- as.vector(coef_1se)[-1]
+  names(coef_vector) <- rownames(coef_1se)[-1]
+  
+  return(names(coef_vector)[coef_vector != 0])
+}
+
+stopCluster(cl)
+
+# 5.0.3: Scoring Compilation & Summary Generation
+all_p2_perm_features <- unlist(progress_perm_results)
+if (length(all_p2_perm_features) > 0) {
+  p2_perm_table <- table(all_p2_perm_features) / 100
+  p2_threshold <- max(0.20, min(0.60, as.numeric(quantile(p2_perm_table, 0.99))))
+} else {
+  p2_threshold <- 0.15
+}
+
+p2_real_features <- unlist(lapply(progress_real_results, function(x) x$features))
+p2_real_directions <- unlist(lapply(progress_real_results, function(x) x$directions))
+
+p2_freq_df <- data.frame(feature = p2_real_features, direction = p2_real_directions, stringsAsFactors = FALSE)
+axis2_summary <- p2_freq_df %>%
+  group_by(feature) %>%
+  summarize(
+    global_progression_frequency = n() / 100,
+    mean_direction_progression = mean(direction),
+    .groups = "drop"
+  )
+
+# Calculate true mean staging delta metrics (Mean_Late - Mean_Early)
+all_p2_features_pool <- unique(axis2_summary$feature)
+delta_progression <- numeric(length(all_p2_features_pool))
+names(delta_progression) <- all_p2_features_pool
+
+early_barcodes <- progress_train_meta$sample_barcode_15[progress_train_meta$class == "Early"]
+late_barcodes  <- progress_train_meta$sample_barcode_15[progress_train_meta$class == "Late"]
+
+for (feat in all_p2_features_pool) {
+  if (feat %in% rownames(mrna_sync)) {
+    delta_progression[feat] <- mean(mrna_sync[feat, late_barcodes]) - mean(mrna_sync[feat, early_barcodes])
+  } else if (feat %in% rownames(mirna_sync)) {
+    delta_progression[feat] <- mean(mirna_sync[feat, late_barcodes]) - mean(mirna_sync[feat, early_barcodes])
+  } else if (feat %in% rownames(met_sync)) {
+    delta_progression[feat] <- mean(met_sync[feat, late_barcodes]) - mean(met_sync[feat, early_barcodes])
+  } else if (feat %in% rownames(cnv_sync)) {
+    delta_progression[feat] <- mean(cnv_sync[feat, late_barcodes]) - mean(cnv_sync[feat, early_early_barcodes])
+  } else if (feat %in% rownames(rppa_sync)) {
+    delta_progression[feat] <- mean(rppa_sync[feat, late_barcodes]) - mean(rppa_sync[feat, early_barcodes])
+  }
+}
+
+axis2_summary$directional_delta_progression <- delta_progression[axis2_summary$feature]
+axis2_summary$is_global_progression_candidate <- axis2_summary$global_progression_frequency >= p2_threshold
+
+fwrite(axis2_summary, file = file.path(config$csv_dir, "axis2_global_progression_weights.csv"))
+saveRDS(axis2_summary, file = file.path(config$out_dir, "axis2_global_progression_scored_summary.rds"))
+
+cat(sprintf("Step 5.0 Complete: Identified %d global progression driver candidates across all clinical classes.\n",
+            sum(axis2_summary$is_global_progression_candidate)))
