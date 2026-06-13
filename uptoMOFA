@@ -1,0 +1,740 @@
+ ==============================================================================
+# SECTION 0: CONFIGURATION — Set all paths here
+# ==============================================================================
+
+config <- list(
+  # Input / output directories
+  raw_dir   = "data/raw",          # Where GDCdownload saves raw .rda files
+  out_dir   = "data/processed",    # Where processed .rda files are saved
+  plot_dir  = "results/plots/qc",  # QC plots
+  csv_dir   = "results/tables",    # Exported CSV tables
+
+  # External annotation files (download before running)
+  # Pidsley et al. 2016 cross-reactive probes:
+  #   https://static-content.springer.com/esm/art%3A10.1186%2Fs13059-016-1066-1/
+  #   MediaObjects/13059_2016_1066_MOESM1_ESM.csv
+  pidsley_file    = "data/annotations/pidsley_cross_reactive_probes.csv",
+
+  # TCGA RPPA antibody annotations (download from GDC):
+  #   https://gdc.cancer.gov/about-data/publications/pancanatlas
+  antibody_anno   = "data/annotations/TCGA_antibodies_descriptions.gencode.v36.tsv",
+
+  # Clinical metadata (generated after MOFA, or pre-prepared from TCGA clinical data)
+  clin_csv        = "data/clinical/common_samples_clinical.csv",
+
+  # GDC project
+  project         = "TCGA-BRCA",
+
+  # Reproducibility seed
+  seed            = 42L
+)
+
+# Create output directories
+for (d in c(config$raw_dir, config$out_dir, config$plot_dir, config$csv_dir)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+
+# ==============================================================================
+# SECTION 1: LIBRARIES
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(TCGAbiolinks)
+  library(DESeq2)
+  library(edgeR)
+  library(limma)
+  library(sva)
+  library(MOFA2)
+  library(SummarizedExperiment)
+  library(minfi)
+  library(wateRmelon)
+  library(impute)
+  library(preprocessCore)
+  library(miRBaseConverter)
+  library(org.Hs.eg.db)
+  library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+  library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+  library(GenomicRanges)
+  library(tidyverse)
+  library(data.table)
+})
+
+# Record session information for reproducibility
+writeLines(capture.output(sessionInfo()),
+           file.path(config$out_dir, "sessionInfo.txt"))
+cat("Session info saved.\n")
+
+
+# ==============================================================================
+# SECTION 1A: HELPER FUNCTIONS
+# ==============================================================================
+
+#' Standardise TCGA barcodes to 15 characters (patient-aliquot level)
+standardize_barcodes <- function(barcodes) substr(barcodes, 1, 15)
+
+#' Extract plate ID from full TCGA barcode (positions 22-25) for batch correction
+get_plate_id <- function(barcodes) substr(barcodes, 22, 25)
+
+#' Save a tiff QC plot safely
+save_tiff <- function(path, expr, width = 6, height = 6, res = 300) {
+  tiff(path, width = width, height = height, units = "in", res = res)
+  tryCatch(force(expr), finally = dev.off())
+}
+
+
+# ==============================================================================
+# SECTION 2: GDC QUERY, DOWNLOAD, AND PREPARE
+# Skip this section if .rda files already exist in config$raw_dir
+# ==============================================================================
+
+## 2.1  Barcodes to exclude (known quality issues from prior QC)
+unwanted_barcodes <- c(
+  "TCGA-A2-A25A-01A-12R-A16F-07", "TCGA-LL-A440-01A-11R-A24H-07",
+  "TCGA-S3-AA17-01A-11R-A41B-07", "TCGA-GM-A2DO-01A-11R-A18M-07",
+  "TCGA-B6-A0RM-01A-11R-A084-07", "TCGA-AR-A0U1-01A-11R-A115-07",
+  "TCGA-A7-A0DC-01A-11R-A00Z-07", "TCGA-BH-A0B2-01A-11R-A10J-07"
+)
+unwanted_samples <- standardize_barcodes(unwanted_barcodes)
+
+## 2.2  Initial queries to identify common samples across modalities
+query_mrna <- GDCquery(
+  project               = config$project,
+  data.category         = "Transcriptome Profiling",
+  data.type             = "Gene Expression Quantification",
+  experimental.strategy = "RNA-Seq"
+)
+query_mirna <- GDCquery(
+  project       = config$project,
+  data.category = "Transcriptome Profiling",
+  data.type     = "Isoform Expression Quantification",
+  workflow.type = "BCGSC miRNA Profiling"
+)
+query_methyl <- GDCquery(
+  project       = config$project,
+  data.category = "DNA Methylation",
+  data.type     = "Methylation Beta Value",
+  platform      = "Illumina Human Methylation 450"
+)
+query_cnv <- GDCquery(
+  project       = config$project,
+  data.category = "Copy Number Variation",
+  data.type     = "Masked Copy Number Segment"
+)
+query_protein <- GDCquery(
+  project               = config$project,
+  data.category         = "Proteome Profiling",
+  data.type             = "Protein Expression Quantification",
+  experimental.strategy = "Reverse Phase Protein Array"
+)
+
+## 2.3  Intersect barcodes across all five modalities
+common_samples <- Reduce(intersect, list(
+  standardize_barcodes(getResults(query_mrna,    cols = "cases")),
+  standardize_barcodes(getResults(query_mirna,   cols = "cases")),
+  standardize_barcodes(getResults(query_methyl,  cols = "cases")),
+  standardize_barcodes(getResults(query_cnv,     cols = "cases")),
+  standardize_barcodes(getResults(query_protein, cols = "cases"))
+))
+common_samples <- sort(setdiff(common_samples, unwanted_samples))
+cat("Common samples after exclusions:", length(common_samples), "\n")
+
+## 2.4  Re-query restricted to common samples
+re_query <- function(q, barcodes) {
+  GDCquery(
+    project               = q$project,
+    data.category         = q$data.category,
+    data.type             = q$data.type,
+    experimental.strategy = q$experimental.strategy,
+    workflow.type         = q$workflow.type,
+    platform              = q$platform,
+    barcode               = barcodes
+  )
+}
+query_mrna    <- re_query(query_mrna,    common_samples)
+query_mirna   <- re_query(query_mirna,   common_samples)
+query_methyl  <- re_query(query_methyl,  common_samples)
+query_cnv     <- re_query(query_cnv,     common_samples)
+query_protein <- re_query(query_protein, common_samples)
+
+## 2.5  Download and prepare raw objects
+GDCdownload(query_mrna,    method = "api")
+GDCdownload(query_mirna,   method = "api")
+GDCdownload(query_methyl,  method = "api")
+GDCdownload(query_protein, method = "api")
+GDCdownload(query_cnv,     method = "api", files.per.chunk = 10)
+
+GDCprepare(query_mrna,    save = TRUE, save.filename = file.path(config$raw_dir, "RNA.rda"))
+GDCprepare(query_mirna,   save = TRUE, save.filename = file.path(config$raw_dir, "miRNA.rda"))
+GDCprepare(query_methyl,  save = TRUE, save.filename = file.path(config$raw_dir, "met.rda"))
+GDCprepare(query_protein, save = TRUE, save.filename = file.path(config$raw_dir, "prot.rda"))
+GDCprepare(query_cnv,     save = TRUE, save.filename = file.path(config$raw_dir, "cnv.rda"))
+
+
+# ==============================================================================
+# SECTION 3: mRNA PREPROCESSING
+# Filtering: genes with < 10 counts in > 80% samples are removed.
+# Normalisation: DESeq2 VST (blind = FALSE, preserves biological variation).
+# Batch correction: ComBat on plate ID (barcode positions 22-25).
+# ==============================================================================
+
+cat("\n--- mRNA preprocessing ---\n")
+load(file.path(config$raw_dir, "RNA.rda"))
+rna <- data; rm(data)
+
+counts   <- assay(rna, "unstranded")
+row_data <- rowData(rna)
+col_data <- colData(rna)
+
+# Build DESeqDataSet with intercept-only design (unsupervised VST)
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = col_data, design = ~1)
+
+# Pre-filter: keep genes with >= 10 counts in at least 20% of samples
+keep <- rowSums(counts(dds) >= 10) >= (ncol(dds) * 0.2)
+dds  <- dds[keep, ]
+cat("  Genes retained after filtering:", sum(keep), "\n")
+
+# VST
+dds       <- estimateSizeFactors(dds)
+vsd       <- varianceStabilizingTransformation(dds, blind = FALSE)
+exprs_vst <- assay(vsd)
+
+# Batch correction using plate ID extracted from FULL barcode (before truncation)
+batch_rna    <- get_plate_id(colnames(exprs_vst))
+exprs_combat <- ComBat(dat = exprs_vst, batch = batch_rna, par.prior = TRUE)
+
+# Map Ensembl IDs -> gene symbols using rowData (no network required)
+gene_symbols <- row_data$gene_name[match(rownames(exprs_combat), rownames(row_data))]
+rownames(exprs_combat) <- ifelse(
+  is.na(gene_symbols) | gene_symbols == "",
+  rownames(exprs_combat),
+  gene_symbols
+)
+
+# Remove duplicate gene symbols (keep first occurrence after VST ordering)
+exprs_combat <- exprs_combat[!duplicated(rownames(exprs_combat)), ]
+
+cat("  Final mRNA dimensions:", dim(exprs_combat), "\n")
+cat("  Missing values:", sum(is.na(exprs_combat)), "\n")
+
+save_tiff(file.path(config$plot_dir, "qc_mrna_boxplot.tiff"), {
+  boxplot(t(scale(t(exprs_combat[sample(nrow(exprs_combat), 200), ]))),
+          main = "mRNA — scaled expression (random 200 genes)",
+          col = "lightblue", las = 2, cex.axis = 0.4, outline = FALSE)
+})
+
+save(exprs_combat, file = file.path(config$out_dir, "rna_processed.rda"))
+cat("  Saved: rna_processed.rda\n")
+
+
+# ==============================================================================
+# SECTION 4: miRNA PREPROCESSING
+# Mapping: miRBase v22 mature miRNA identifiers (MIMAT accessions, human only).
+# Filtering: CPM > 1 in at least 20% of samples.
+# Normalisation: TMM + voom transformation.
+# Batch correction: ComBat on plate ID.
+# ==============================================================================
+
+cat("\n--- miRNA preprocessing ---\n")
+load(file.path(config$raw_dir, "miRNA.rda"))
+mirna_raw <- data; rm(data)
+
+# Load miRBase v22 annotations — human mature miRNAs only
+mirbase_db    <- getAllMiRNAs(version = "v22")
+mature_mirnas <- mirbase_db %>%
+  filter(grepl("^hsa", Name), grepl("^MIMAT", Accession)) %>%
+  dplyr::select(mimat_id = Accession, mature_miRNA = Name) %>%
+  distinct(mimat_id, .keep_all = TRUE)
+
+# Build count matrix from long-format isoform quantification data
+mirna_counts <- mirna_raw %>%
+  filter(grepl("^mature", miRNA_region, ignore.case = TRUE),
+         `cross-mapped` == "N") %>%
+  separate(miRNA_region, into = c("type", "mimat_id"),
+           sep = ",", extra = "drop", fill = "right") %>%
+  mutate(mimat_id = trimws(mimat_id)) %>%
+  left_join(mature_mirnas, by = "mimat_id") %>%
+  filter(!is.na(mature_miRNA)) %>%
+  group_by(mature_miRNA, barcode) %>%
+  summarise(total_count = sum(read_count, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = barcode, values_from = total_count, values_fill = 0L) %>%
+  column_to_rownames("mature_miRNA") %>%
+  as.matrix()
+
+# edgeR: filter and TMM normalisation
+dge  <- DGEList(counts = mirna_counts)
+keep <- rowSums(cpm(dge) > 1) >= (ncol(mirna_counts) * 0.2)
+dge  <- dge[keep, , keep.lib.sizes = FALSE]
+dge  <- calcNormFactors(dge)
+cat("  miRNAs retained after CPM filtering:", nrow(dge), "\n")
+
+# voom transformation
+design_mirna <- model.matrix(~1, data = dge$samples)
+save_tiff(file.path(config$plot_dir, "qc_mirna_voom.tiff"),
+          { v <- voom(dge, design = design_mirna, plot = TRUE) })
+v <- voom(dge, design = design_mirna, plot = FALSE)
+
+# Batch correction
+batch_mirna   <- get_plate_id(colnames(v$E))
+combat_counts <- ComBat(dat = v$E, batch = batch_mirna, par.prior = TRUE)
+combat_counts <- combat_counts[!duplicated(rownames(combat_counts)), ]
+
+cat("  Final miRNA dimensions:", dim(combat_counts), "\n")
+cat("  Missing values:", sum(is.na(combat_counts)), "\n")
+
+save(combat_counts, file = file.path(config$out_dir, "mirna_processed.rda"))
+cat("  Saved: mirna_processed.rda\n")
+
+
+# ==============================================================================
+# SECTION 5: DNA METHYLATION PREPROCESSING
+# Probe filtering:
+#   (1) Cross-reactive probes (Pidsley et al. 2016, Genome Biology)
+#   (2) Sex chromosome probes (chrX, chrY)
+#   (3) SNP-associated probes (Probe_rs column)
+#   (4) Non-CpG island probes (Relation_to_Island == "OpenSea")
+# Missing values: remove probes > 10% NA; impute remainder with kNN (k=5).
+# Normalisation: BMIQ (wateRmelon).
+# M-value conversion: logit(beta); extreme values winsorised at 0.1%/99.9%.
+# Batch correction: ComBat on plate ID.
+# ==============================================================================
+
+cat("\n--- Methylation preprocessing ---\n")
+load(file.path(config$raw_dir, "met.rda"))
+methyl <- data; rm(data)
+
+beta_matrix <- assay(methyl, 1)
+anno        <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+anno_df     <- as.data.frame(anno)
+
+# Load Pidsley et al. 2016 cross-reactive probes
+if (!file.exists(config$pidsley_file)) {
+  stop("Pidsley cross-reactive probe file not found: ", config$pidsley_file,
+       "\nDownload from: https://static-content.springer.com/esm/",
+       "art%3A10.1186%2Fs13059-016-1066-1/MediaObjects/",
+       "13059_2016_1066_MOESM1_ESM.csv")
+}
+pidsley        <- read.csv(config$pidsley_file, stringsAsFactors = FALSE)
+cross_reactive <- pidsley$X[pidsley$Total > 0]
+
+# Build exclusion list
+probes_in_data <- intersect(rownames(beta_matrix), rownames(anno_df))
+anno_sub       <- anno_df[probes_in_data, ]
+
+bad_probes <- unique(c(
+  intersect(rownames(anno_sub), cross_reactive),                           # cross-reactive
+  rownames(anno_sub)[anno_sub$chr %in% c("chrX", "chrY")],                # sex chromosomes
+  rownames(anno_sub)[!is.na(anno_sub$Probe_rs) &
+                       anno_sub$Probe_rs != "" &
+                       grepl("rs", anno_sub$Probe_rs)],                    # SNP probes
+  rownames(anno_sub)[anno_sub$Relation_to_Island == "OpenSea"]             # non-CGI probes
+))
+
+beta_filtered <- beta_matrix[probes_in_data, ]
+beta_filtered <- beta_filtered[!rownames(beta_filtered) %in% bad_probes, ]
+cat("  Probes after filtering:", nrow(beta_filtered), "\n")
+
+# Remove probes with > 10% missingness
+beta_filtered <- beta_filtered[rowMeans(is.na(beta_filtered)) < 0.1, ]
+cat("  Probes after NA filtering (>10%):", nrow(beta_filtered), "\n")
+
+# kNN imputation (k = 5) on remaining NAs
+set.seed(config$seed)
+beta_imputed <- impute.knn(beta_filtered, k = 5)$data
+
+# BMIQ normalisation
+anno_bmiq     <- anno_df[rownames(beta_imputed), ]
+design_vector <- ifelse(anno_bmiq$Type == "I", 1, 2)
+if (any(is.na(design_vector))) {
+  beta_imputed  <- beta_imputed[!is.na(design_vector), ]
+  anno_bmiq     <- anno_df[rownames(beta_imputed), ]
+  design_vector <- ifelse(anno_bmiq$Type == "I", 1, 2)
+}
+beta_norm <- BMIQ(beta_imputed, design.v = design_vector, plots = FALSE)$nbeta
+
+# Beta -> M-value conversion with epsilon guard
+epsilon    <- 1e-6
+beta_clamped <- pmax(pmin(beta_norm, 1 - epsilon), epsilon)
+m_values   <- log2(beta_clamped / (1 - beta_clamped))
+
+# Winsorise extreme M-values
+upper      <- quantile(m_values, 0.9999, na.rm = TRUE)
+lower      <- quantile(m_values, 0.0001, na.rm = TRUE)
+m_values[m_values > upper] <- upper
+m_values[m_values < lower] <- lower
+
+# Batch correction
+batch_methyl <- get_plate_id(colnames(m_values))
+mod          <- model.matrix(~1, data = data.frame(sample = colnames(m_values)))
+m_combat     <- ComBat(dat = m_values, batch = batch_methyl,
+                       mod = mod, par.prior = TRUE)
+
+cat("  Final methylation dimensions:", dim(m_combat), "\n")
+
+# QC density plots
+save_tiff(file.path(config$plot_dir, "qc_methylation_density.tiff"),
+          width = 10, height = 8, {
+  par(mfrow = c(2, 2))
+  densityPlot(beta_matrix[sample(nrow(beta_matrix), 5000), ],
+              main = "Raw Beta Values", legend = FALSE)
+  densityPlot(beta_norm[sample(nrow(beta_norm), 5000), ],
+              main = "BMIQ Normalised Beta Values", legend = FALSE)
+  densityPlot(m_values[sample(nrow(m_values), 5000), ],
+              main = "M-values (pre-batch correction)", legend = FALSE)
+  densityPlot(m_combat[sample(nrow(m_combat), 5000), ],
+              main = "M-values (post-batch correction)", legend = FALSE)
+})
+
+save(m_combat, file = file.path(config$out_dir, "methyl_processed.rda"))
+cat("  Saved: methyl_processed.rda\n")
+
+
+# ==============================================================================
+# SECTION 6: CNV PREPROCESSING
+# Gene-level scores: median Segment_Mean of all segments overlapping each gene
+# (hg19 coordinates via TxDb.Hsapiens.UCSC.hg19.knownGene).
+# Missing values: kNN imputation (k = 5).
+# ==============================================================================
+
+cat("\n--- CNV preprocessing ---\n")
+load(file.path(config$raw_dir, "cnv.rda"))
+cnv_raw <- data; rm(data)
+
+# Standardise segment table
+seg_clean <- cnv_raw %>%
+  mutate(
+    Sample = standardize_barcodes(Sample),
+    Chromosome = case_when(
+      Chromosome == "X" ~ "chrX",
+      Chromosome == "Y" ~ "chrY",
+      TRUE ~ paste0("chr", str_remove(as.character(Chromosome), "^chr"))
+    )
+  ) %>%
+  dplyr::select(Sample, Chromosome, Start, End, Num_Probes, Segment_Mean)
+
+# Create GRanges and overlap with hg19 gene coordinates
+cnv_gr   <- makeGRangesFromDataFrame(seg_clean, start.field = "Start",
+                                      end.field = "End", keep.extra.columns = TRUE)
+genes_gr <- genes(TxDb.Hsapiens.UCSC.hg19.knownGene)
+overlaps <- findOverlaps(cnv_gr, genes_gr)
+
+gene_cnv <- data.frame(
+  gene_id      = names(genes_gr)[subjectHits(overlaps)],
+  sample       = mcols(cnv_gr)$Sample[queryHits(overlaps)],
+  segment_mean = mcols(cnv_gr)$Segment_Mean[queryHits(overlaps)]
+) %>%
+  group_by(gene_id, sample) %>%
+  summarise(cnv_score = median(segment_mean), .groups = "drop")
+
+# Entrez -> gene symbol
+gene_symbols_cnv     <- mapIds(org.Hs.eg.db, keys = gene_cnv$gene_id,
+                                column = "SYMBOL", keytype = "ENTREZID",
+                                multiVals = "first")
+gene_cnv$gene_symbol <- gene_symbols_cnv
+
+cnv_matrix <- gene_cnv %>%
+  filter(!is.na(gene_symbol)) %>%
+  dplyr::select(gene_symbol, sample, cnv_score) %>%
+  pivot_wider(names_from = sample, values_from = cnv_score, values_fill = 0) %>%
+  column_to_rownames("gene_symbol") %>%
+  as.matrix()
+
+# kNN imputation
+set.seed(config$seed)
+cnv_imputed <- impute.knn(cnv_matrix, k = 5)$data
+stopifnot(sum(is.na(cnv_imputed)) == 0)
+
+cat("  Final CNV dimensions:", dim(cnv_imputed), "\n")
+save(cnv_imputed, file = file.path(config$out_dir, "cnv_processed.rda"))
+cat("  Saved: cnv_processed.rda\n")
+
+
+# ==============================================================================
+# SECTION 7: PROTEIN (RPPA) PREPROCESSING
+# Missing values: remove features > 10% NA; impute remainder with kNN (k=5).
+# Normalisation: quantile normalisation (preprocessCore).
+# Annotation: antibody ID -> gene_symbol_peptideTarget (e.g., "AKT1_pS473").
+# Aggregation: multiple antibodies per gene averaged.
+# Batch correction: ComBat.
+# ==============================================================================
+
+cat("\n--- Protein preprocessing ---\n")
+load(file.path(config$raw_dir, "prot.rda"))
+protein <- data; rm(data)
+
+# Load antibody annotations
+if (!file.exists(config$antibody_anno)) {
+  stop("Antibody annotation file not found: ", config$antibody_anno)
+}
+antibody_anno <- read.delim(config$antibody_anno) %>%
+  dplyr::select(AGID, Gene_Symbol = gene_name, Peptide_Target = peptide_target)
+
+# Extract expression matrix (TCGA sample columns only)
+expr_cols   <- grep("TCGA", colnames(protein), value = TRUE)
+prot_matrix <- protein %>%
+  dplyr::select(all_of(expr_cols)) %>%
+  as.matrix()
+rownames(prot_matrix) <- paste(protein$AGID, protein$peptide_target, sep = "_")
+
+# Remove features with > 10% missingness
+prot_filtered <- prot_matrix[rowMeans(is.na(prot_matrix)) <= 0.1, ]
+cat("  Features after missingness filter:", nrow(prot_filtered), "\n")
+
+# kNN imputation
+set.seed(config$seed)
+prot_imputed <- impute.knn(prot_filtered, k = 5)$data
+
+# Quantile normalisation — explicitly restore dimension names
+prot_norm             <- normalize.quantiles(prot_imputed)
+rownames(prot_norm)   <- rownames(prot_imputed)
+colnames(prot_norm)   <- colnames(prot_imputed)
+
+# Map antibody IDs -> annotated names
+protein_ids <- data.frame(
+  Row_ID = rownames(prot_norm),
+  AGID   = sapply(strsplit(rownames(prot_norm), "_"), "[", 1)
+)
+
+annotated <- protein_ids %>%
+  left_join(antibody_anno, by = "AGID") %>%
+  mutate(Final_Symbol = case_when(
+    !is.na(Peptide_Target) & !is.na(Gene_Symbol) ~ paste0(Gene_Symbol, "_", Peptide_Target),
+    is.na(Gene_Symbol)                            ~ paste0("AG_", AGID),
+    TRUE                                          ~ Gene_Symbol
+  ))
+rownames(prot_norm) <- annotated$Final_Symbol
+
+# Aggregate duplicate antibodies by mean
+prot_agg <- prot_norm %>%
+  as.data.frame() %>%
+  rownames_to_column("Symbol") %>%
+  group_by(Symbol) %>%
+  summarise(across(everything(),
+                   ~ if (all(is.na(.x))) NA_real_ else mean(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  filter(!is.na(Symbol)) %>%
+  column_to_rownames("Symbol") %>%
+  as.matrix()
+
+prot_clean <- prot_agg[complete.cases(prot_agg), ]
+
+# Batch correction
+batch_prot  <- get_plate_id(colnames(prot_clean))
+# Some batches may have only one sample — ComBat handles this but will warn
+prot_combat <- tryCatch(
+  ComBat(dat = prot_clean, batch = batch_prot, par.prior = TRUE),
+  error = function(e) {
+    warning("ComBat failed for protein; returning uncorrected matrix. Error: ", e$message)
+    prot_clean
+  }
+)
+
+cat("  Final protein dimensions:", dim(prot_combat), "\n")
+save(prot_combat, file = file.path(config$out_dir, "protein_processed.rda"))
+cat("  Saved: protein_processed.rda\n")
+
+
+# ==============================================================================
+# SECTION 8: ALIGN SAMPLES ACROSS ALL MODALITIES
+# ==============================================================================
+
+cat("\n--- Aligning samples across modalities ---\n")
+
+load(file.path(config$out_dir, "rna_processed.rda"))     # exprs_combat
+load(file.path(config$out_dir, "mirna_processed.rda"))   # combat_counts
+load(file.path(config$out_dir, "methyl_processed.rda"))  # m_combat
+load(file.path(config$out_dir, "cnv_processed.rda"))     # cnv_imputed
+load(file.path(config$out_dir, "protein_processed.rda")) # prot_combat
+
+# Truncate barcodes to 15 characters AFTER batch correction
+colnames(exprs_combat)  <- standardize_barcodes(colnames(exprs_combat))
+colnames(combat_counts) <- standardize_barcodes(colnames(combat_counts))
+colnames(m_combat)      <- standardize_barcodes(colnames(m_combat))
+colnames(cnv_imputed)   <- standardize_barcodes(colnames(cnv_imputed))
+colnames(prot_combat)   <- standardize_barcodes(colnames(prot_combat))
+
+# Five-way intersection
+common_samples <- Reduce(intersect, list(
+  colnames(exprs_combat),
+  colnames(combat_counts),
+  colnames(m_combat),
+  colnames(cnv_imputed),
+  colnames(prot_combat)
+))
+common_samples <- sort(common_samples)
+cat("  Final common samples:", length(common_samples), "\n")
+
+rna_common    <- exprs_combat[ , common_samples, drop = FALSE]
+mirna_common  <- combat_counts[, common_samples, drop = FALSE]
+methyl_common <- m_combat[     , common_samples, drop = FALSE]
+cnv_common    <- cnv_imputed[  , common_samples, drop = FALSE]
+prot_common   <- prot_combat[  , common_samples, drop = FALSE]
+
+# Verify alignment
+stopifnot(
+  identical(colnames(rna_common),    common_samples),
+  identical(colnames(mirna_common),  common_samples),
+  identical(colnames(methyl_common), common_samples),
+  identical(colnames(cnv_common),    common_samples),
+  identical(colnames(prot_common),   common_samples)
+)
+cat("  Sample alignment verified.\n")
+
+cat("  RNA:         ", dim(rna_common), "\n")
+cat("  miRNA:       ", dim(mirna_common), "\n")
+cat("  Methylation: ", dim(methyl_common), "\n")
+cat("  CNV:         ", dim(cnv_common), "\n")
+cat("  Protein:     ", dim(prot_common), "\n")
+
+# Load and align clinical data
+clin_data <- read.csv(config$clin_csv, stringsAsFactors = FALSE)
+clin_data$sample_id <- standardize_barcodes(clin_data$sample_id)
+
+clin_filtered <- clin_data %>%
+  filter(sample_id %in% common_samples) %>%
+  arrange(match(sample_id, common_samples))
+
+stopifnot(identical(clin_filtered$sample_id, common_samples))
+cat("  Clinical data aligned.\n")
+cat("  Stage distribution:\n")
+print(table(clin_filtered$stage_classification))
+
+# Export aligned matrices as CSVs for Python downstream analysis
+fwrite(as.data.table(rna_common,    keep.rownames = "Feature"),
+       file.path(config$csv_dir, "rna_samples.csv"))
+fwrite(as.data.table(mirna_common,  keep.rownames = "Feature"),
+       file.path(config$csv_dir, "miRNA_samples.csv"))
+fwrite(as.data.table(methyl_common, keep.rownames = "Feature"),
+       file.path(config$csv_dir, "methylation_samples.csv"))
+fwrite(as.data.table(cnv_common,    keep.rownames = "Feature"),
+       file.path(config$csv_dir, "cnv_samples.csv"))
+fwrite(as.data.table(prot_common,   keep.rownames = "Feature"),
+       file.path(config$csv_dir, "protein_samples.csv"))
+write.csv(clin_filtered, file.path(config$csv_dir, "clin_common.csv"),
+          row.names = FALSE)
+cat("  All aligned matrices exported to CSV.\n")
+
+
+# ==============================================================================
+# SECTION 9: PREPARE DATA FOR MOFA+
+# Each feature is z-scored across samples (mean = 0, SD = 1).
+# Features with zero variance (all-NA post-scaling) are removed.
+# ==============================================================================
+
+cat("\n--- Preparing MOFA+ input ---\n")
+
+prep_for_mofa <- function(mat) {
+  scaled <- t(scale(t(mat)))            # z-score per feature across samples
+  scaled[complete.cases(scaled), ]      # drop zero-variance / all-NA rows
+}
+
+mrna_scaled   <- prep_for_mofa(rna_common)
+mirna_scaled  <- prep_for_mofa(mirna_common)
+methyl_scaled <- prep_for_mofa(methyl_common)
+cnv_scaled    <- prep_for_mofa(cnv_common)
+prot_scaled   <- prep_for_mofa(prot_common)
+
+cat("  Post-scaling dimensions:\n")
+cat("    mRNA:        ", dim(mrna_scaled), "\n")
+cat("    miRNA:       ", dim(mirna_scaled), "\n")
+cat("    Methylation: ", dim(methyl_scaled), "\n")
+cat("    CNV:         ", dim(cnv_scaled), "\n")
+cat("    Protein:     ", dim(prot_scaled), "\n")
+
+
+# ==============================================================================
+# SECTION 10: TRAIN MOFA+ MODEL
+# Model options: ARD prior on factors, Spike-and-Slab prior on weights.
+# Training: convergence_mode = "slow"; drop_factor_threshold = -1 (keep all);
+#           seed = 42 for reproducibility.
+# Five candidate models trained (k = 10, 15, 20, 25, 30); k = 20 selected
+# based on total variance explained and inter-factor correlation.
+# ==============================================================================
+
+cat("\n--- Training MOFA+ models ---\n")
+
+mofa_input <- list(
+  mRNA        = mrna_scaled,
+  miRNA       = mirna_scaled,
+  Methylation = methyl_scaled,
+  CNV         = cnv_scaled,
+  Protein     = prot_scaled
+)
+
+# Train models for each candidate k; save each separately
+for (k in c(10, 15, 20, 25, 30)) {
+  cat("  Training k =", k, "...\n")
+
+  MOFAobject <- create_mofa(mofa_input)
+
+  data_opts  <- get_default_data_options(MOFAobject)
+
+  model_opts                   <- get_default_model_options(MOFAobject)
+  model_opts$num_factors       <- k
+  model_opts$ard_factors       <- TRUE   # ARD prior enables automatic factor pruning
+  model_opts$spikeslab_weights <- TRUE   # Sparse weights (Spike-and-Slab)
+
+  train_opts                       <- get_default_training_options(MOFAobject)
+  train_opts$convergence_mode      <- "slow"
+  train_opts$drop_factor_threshold <- -1   # Keep all factors regardless of variance
+  train_opts$seed                  <- config$seed
+  train_opts$freqELBO              <- 1
+
+  MOFAobject <- prepare_mofa(MOFAobject,
+                              data_options     = data_opts,
+                              model_options    = model_opts,
+                              training_options = train_opts)
+
+  outfile    <- file.path(config$out_dir, sprintf("mofa_k%02d.hdf5", k))
+  MOFAobject <- run_mofa(MOFAobject, outfile = outfile, use_basilisk = TRUE)
+  cat("  Saved:", outfile, "\n")
+}
+
+# ==============================================================================
+# SECTION 11: LOAD SELECTED MODEL (k = 20) AND EXTRACT RESULTS
+# k = 20 selected after visual inspection of variance decomposition heatmap and
+# pairwise factor correlation matrix (see supplementary figures).
+# ==============================================================================
+
+cat("\n--- Extracting results from selected model (k = 20) ---\n")
+
+model_file <- file.path(config$out_dir, "mofa_k20.hdf5")
+model      <- load_model(model_file)
+
+# Add clinical metadata to model
+samples_metadata      <- clin_filtered
+model@samples_metadata <- samples_metadata
+
+# Variance explained
+save_tiff(file.path(config$plot_dir, "mofa_variance_heatmap.tiff"),
+          width = 10, height = 6, {
+  plot_variance_explained(model, max_r2 = 15)
+})
+
+var_exp <- get_variance_explained(model)
+write.csv(var_exp$r2_per_factor[[1]],
+          file.path(config$csv_dir, "mofa_variance_per_factor.csv"))
+
+# Extract and save latent factors
+factors_df <- get_factors(model, as.data.frame = TRUE)
+factors_wide <- factors_df %>%
+  pivot_wider(names_from = factor, values_from = value) %>%
+  rename(SampleID = sample) %>%
+  left_join(dplyr::select(clin_filtered, sample_id, stage_classification,
+                           ajcc_pathologic_stage, sample_type),
+            by = c("SampleID" = "sample_id"))
+
+write.csv(factors_wide, file.path(config$csv_dir, "latent_factors.csv"),
+          row.names = FALSE)
+cat("  Latent factors saved.\n")
+
+# Extract and save feature loadings (weights) for all modalities
+loadings <- get_weights(model)
+for (modality in names(loadings)) {
+  df  <- as.data.frame(loadings[[modality]])
+  df  <- rownames_to_column(df, var = "Feature")
+  out <- file.path(config$csv_dir, paste0(modality, "_feature_loadings.csv"))
+  write.csv(df, out, row.names = FALSE)
+}
+cat("  Feature loadings saved for all modalities.\n")
+
