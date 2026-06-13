@@ -1,0 +1,100 @@
+# ==============================================================================
+# PHASE 2 — MASTER COHORT SYNCHRONIZATION & LEAKPROOF DATA SPLITTING
+# Steps 2.0 to 2.3 — Intersecting, Baselining, and Stratified Partitioning
+# ==============================================================================
+
+cat("\n--- Executing Phase 2: Cohort Synchronization & Partitioning ---\n")
+
+# 2.0.1: Load all 5 independently processed molecular layer workspaces
+mrna_layer  <- readRDS(file.path(config$out_dir, "mrna_normalized_corrected.rds"))
+mirna_layer <- readRDS(file.path(config$out_dir, "mirna_normalized_corrected.rds"))
+met_layer   <- readRDS(file.path(config$out_dir, "methyl_normalized_corrected.rds"))
+cnv_layer   <- readRDS(file.path(config$out_dir, "cnv_normalized_corrected.rds"))
+rppa_layer  <- readRDS(file.path(config$out_dir, "rppa_normalized_corrected.rds"))
+
+# 2.0.2: Extract strict intersecting sample denominator across all five layers
+sync_samples <- Reduce(intersect, list(
+  colnames(mrna_layer$matrix),
+  colnames(mirna_layer$matrix),
+  colnames(met_layer$matrix),
+  colnames(cnv_layer$matrix),
+  colnames(rppa_layer$matrix)
+))
+
+cat(sprintf("Synchronization Complete: Identified %d strict intersecting multi-omic samples.\n", 
+            length(sync_samples)))
+
+# Slice and align all five matrices row-for-row, column-for-column
+mrna_sync  <- mrna_layer$matrix[, sync_samples, drop = FALSE]
+mirna_sync <- mirna_layer$matrix[, sync_samples, drop = FALSE]
+met_sync   <- met_layer$matrix[, sync_samples, drop = FALSE]
+cnv_sync   <- cnv_layer$matrix[, sync_samples, drop = FALSE]
+rppa_sync  <- rppa_layer$matrix[, sync_samples, drop = FALSE]
+
+# Slice metadata matrix to match synchronized sample keys
+final_metadata <- mrna_layer$metadata[match(sync_samples, mrna_layer$metadata$sample_barcode_15), ]
+
+# ------------------------------------------------------------------------------
+# Step 2.1: Freeze Raw Baseline Workspace
+# ------------------------------------------------------------------------------
+save(mrna_sync, mirna_sync, met_sync, cnv_sync, rppa_sync, final_metadata,
+     file = file.path(config$out_dir, "raw_synchronized_acquisition_workspace.rda"))
+cat("Step 2.1 Lock complete: Baseline data frozen with NO feature selection applied.\n")
+
+# ------------------------------------------------------------------------------
+# Step 2.2 & 2.3: Leakproof Holdout Partitioning & Training Assignments
+# ------------------------------------------------------------------------------
+library(caret)
+
+# Initialize isolated environment containers for holdout safety
+holdout_env <- new.env(parent = emptyenv())
+training_env <- new.env(parent = emptyenv())
+
+# Create functional partitioning system to handle multi-arm splits without leakage
+execute_leakproof_split <- function(metadata_df, samples_vector, arm_name) {
+  
+  # Filter metadata based on active structural arm criteria
+  arm_meta <- switch(arm_name,
+    "arm_transform"   = metadata_df %>% filter(class %in% c("Normal", "Early")),
+    "arm_stageI_only" = metadata_df %>% filter(class == "Normal" | ajcc_stage %in% c("Stage I", "Stage IA", "Stage IB")),
+    "arm_progress"    = metadata_df %>% filter(class %in% c("Early", "Late"))
+  )
+  
+  # Intersect with available synced samples to preserve multi-omic cohesion
+  arm_meta <- arm_meta %>% filter(sample_barcode_15 %in% samples_vector)
+  
+  # Execute Stratified 80/20 partitioning based on class assignments
+  set.seed(config$seed)
+  train_indices <- createDataPartition(as.factor(arm_meta$class), p = 0.80, list = FALSE)
+  
+  train_pool   <- arm_meta[train_indices, ]
+  holdout_pool <- arm_meta[-train_indices, ]
+  
+  # Target Axis Limitation Documentation Check
+  if (arm_name == "arm_transform") {
+    normal_holdout_n <- sum(holdout_pool$class == "Normal")
+    cat(sprintf("\n[MANUSCRIPT WARNING] The %s holdout contains exactly %d Normal samples.\n", 
+                arm_name, normal_holdout_n))
+    cat("-> Primary output must rely on stability selection frequency and delta metrics.\n")
+    cat("-> ROC AUC metrics for this axis are flagged as statistically unreliable.\n")
+  }
+  
+  return(list(train = train_pool, holdout = holdout_pool))
+}
+
+# Run independent splits for all 3 operational registries
+for (arm in c("arm_transform", "arm_stageI_only", "arm_progress")) {
+  split_output <- execute_leakproof_split(final_metadata, sync_samples, arm)
+  
+  # Bind training vectors and holdout pools to locked target environments
+  assign(paste0(arm, "_train"), split_output$train, envir = training_env)
+  assign(paste0(arm, "_holdout"), split_output$holdout, envir = holdout_env)
+  
+  cat(sprintf("Split Complete [%s] -> Train N: %d, Holdout N: %d\n", 
+              arm, nrow(split_output$train), nrow(split_output$holdout)))
+}
+
+# Lock holdout indices from global manipulation loops
+lockEnvironment(holdout_env, bindings = TRUE)
+save(training_env, file = file.path(config$out_dir, "active_training_pool_registries.rda"))
+cat("\nStep 2.2/2.3 Complete: All splits verified. Holdouts sealed.\n")
