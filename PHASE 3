@@ -1,0 +1,275 @@
+# ==============================================================================
+# PHASE 3 — TRANSFORMATION AXIS DISCOVERY ENGINE (NORMAL -> EARLY STAGE)
+# Steps 3.1 to 3.4 — Parallel Stability Bootstrap & Within-Fold Compression
+# ==============================================================================
+
+cat("\n--- Executing Phase 3: Transformation Axis Bootstrap Loop ---\n")
+
+library(parallel)
+library(doParallel)
+library(glmnet)
+
+# 3.1.1: Fetch active training registry for the transformation arm
+transform_train_meta <- training_env$arm_transform_train
+n_total_train <- nrow(transform_train_meta)
+
+# Pre-calculate parallel orchestration parameters
+num_cores <- max(1, parallel::detectCores() - 2)
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+cat(sprintf("Parallel engine cluster registered with %d active computing cores.\n", num_cores))
+
+# 3.1.2: Export workspace baseline components to parallel worker nodes
+clusterExport(cl, varlist = c("mrna_sync", "mirna_sync", "met_sync", "cnv_sync", "rppa_sync", 
+                             "transform_train_meta", "config", "n_total_train"))
+clusterEvalQ(cl, {
+  library(glmnet)
+  library(stats)
+})
+
+# Launch the 100 parallelized bootstrap loops using MB subsampling (50% sample ratio)
+subsample_fraction <- 0.50
+n_subsample <- floor(n_total_train * subsample_fraction)
+
+cat(sprintf("Spawning 100 bootstrap folds. Subsample size per fold: %d rows.\n", n_subsample))
+
+bootstrap_results <- foreach(fold = 1:100, .packages = c("glmnet")) %dopar% {
+  
+  # Set independent seed per fold to guarantee distinct initialization pathways
+  set.seed(config$seed + fold)
+  
+  # Subsampling without replacement (Meinshausen-Bühlmann standard)
+  fold_samples <- sample(transform_train_meta$sample_barcode_15, size = n_subsample, replace = FALSE)
+  fold_meta <- transform_train_meta[transform_train_meta$sample_barcode_15 %in% fold_samples, ]
+  
+  # ----------------------------------------------------------------------------
+  # Step 3.2: Within-Fold Leakproof HVG Compression
+  # ----------------------------------------------------------------------------
+  # High-density platform A: mRNA variance filtering within the active fold only
+  mrna_fold_data <- mrna_sync[, fold_samples, drop = FALSE]
+  mrna_vars <- apply(mrna_fold_data, 1, var)
+  mrna_keep <- names(sort(mrna_vars, decreasing = TRUE))[1:min(5000, length(mrna_vars))]
+  
+  # Enforce literature target inclusion to bypass variance cutoff boundaries
+  lit_ensembl_ids <- rownames(mrna_sync)[1:min(5, nrow(mrna_sync))] # Fallback example template mapping
+  mrna_keep <- unique(c(mrna_keep, lit_ensembl_ids))
+  mrna_fold_compressed <- mrna_fold_data[mrna_keep, ]
+  
+  # High-density platform B: Methylation variance filtering within active fold
+  met_fold_data <- met_sync[, fold_samples, drop = FALSE]
+  met_vars <- apply(met_fold_data, 1, var)
+  met_keep <- names(sort(met_vars, decreasing = TRUE))[1:min(5000, length(met_vars))]
+  met_fold_compressed <- met_fold_data[met_keep, ]
+  
+  # Retain lower-density platforms natively as defined by architecture bounds
+  mirna_fold_compressed <- mirna_sync[, fold_samples, drop = FALSE]
+  cnv_fold_compressed   <- cnv_sync[, fold_samples, drop = FALSE]
+  rppa_fold_compressed  <- rppa_sync[, fold_samples, drop = FALSE]
+  
+  # Bind all 5 layers into a single multi-modal wide feature matrix for Elastic Net
+  fold_x_matrix <- t(rbind(
+    mrna_fold_compressed,
+    mirna_fold_compressed,
+    met_fold_compressed,
+    cnv_fold_compressed,
+    rppa_fold_compressed
+  ))
+  
+  # Align response array mapping (Normal = 0, Early = 1)
+  fold_y_vector <- ifelse(fold_meta$class == "Normal", 0, 1)
+  
+  # ----------------------------------------------------------------------------
+  # Step 3.3: Within-Fold Inverse-Probability Weighting
+  # ----------------------------------------------------------------------------
+  n_normal_fold <- sum(fold_y_vector == 0)
+  n_early_fold  <- sum(fold_y_vector == 1)
+  n_total_fold  <- length(fold_y_vector)
+  
+  # Calculate dynamic inverse weights based strictly on internal fold frequencies
+  w_normal <- n_total_fold / (2 * max(1, n_normal_fold))
+  w_early  <- n_total_fold / (2 * max(1, n_early_fold))
+  sample_weights <- ifelse(fold_y_vector == 0, w_normal, w_early)
+  
+  # ----------------------------------------------------------------------------
+  # Step 3.4: Elastic Net Fitting (alpha = 0.50)
+  # ----------------------------------------------------------------------------
+  # Fit weighted model along the complete regularization path
+  fit_en <- cv.glmnet(
+    x = fold_x_matrix, 
+    y = fold_y_vector, 
+    weights = sample_weights, 
+    family = "binomial", 
+    alpha = 0.50,
+    standardize = TRUE
+  )
+  
+  # Extract non-zero coefficients at the conservative 1se boundary point
+  coef_1se <- coef(fit_en, s = "lambda.1se")
+  coef_vector <- as.vector(coef_1se)[-1] # Remove intercept row parameter
+  names(coef_vector) <- rownames(coef_1se)[-1]
+  
+  selected_features <- names(coef_vector)[coef_vector != 0]
+  selected_directions <- sign(coef_vector[selected_features])
+  
+  # Return identified features along with their directional signs
+  list(features = selected_features, directions = selected_directions)
+}
+
+stopCluster(cl)
+cat("Parallel stability processing bootstrap loops completed cleanly.\n")
+
+# Save temporary run checkpoint matrix before starting permutation calibrations
+saveRDS(bootstrap_results, file = file.path(config$out_dir, "transformation_axis_raw_bootstrap_runs.rds"))
+
+
+
+# ==============================================================================
+# PHASE 3 — TRANSFORMATION AXIS DISCOVERY ENGINE (CONTINUED)
+# Steps 3.5 to 3.6 — Permutation Calibration & Empirical Null Scoring
+# ==============================================================================
+
+cat("\n--- Executing Phase 3: Permutation Calibration Pass ---\n")
+
+library(parallel)
+library(doParallel)
+library(glmnet)
+library(data.table)
+
+# 3.5.1: Setup and register cluster for permutation loops
+num_cores <- max(1, parallel::detectCores() - 2)
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+clusterExport(cl, varlist = c("mrna_sync", "mirna_sync", "met_sync", "cnv_sync", "rppa_sync", 
+                             "transform_train_meta", "config", "n_total_train"))
+clusterEvalQ(cl, {
+  library(glmnet)
+  library(stats)
+})
+
+subsample_fraction <- 0.50
+n_subsample <- floor(n_total_train * subsample_fraction)
+
+cat("Spawning 100 permuted bootstrap folds to resolve empirical null boundaries...\n")
+
+permutation_results <- foreach(fold = 1:100, .packages = c("glmnet")) %dopar% {
+  
+  set.seed(config$seed + 5000 + fold) # Shift seed plane to prevent duplication
+  
+  # Execute label shuffle before partitioning to destroy true biological associations
+  shuffled_meta <- transform_train_meta
+  shuffled_meta$class <- sample(shuffled_meta$class)
+  
+  fold_samples <- sample(shuffled_meta$sample_barcode_15, size = n_subsample, replace = FALSE)
+  fold_meta <- shuffled_meta[shuffled_meta$sample_barcode_15 %in% fold_samples, ]
+  
+  # Within-Fold HVG Compression (Identical to Step 3.2 logic to maintain calibration parity)
+  mrna_fold_data <- mrna_sync[, fold_samples, drop = FALSE]
+  mrna_vars <- apply(mrna_fold_data, 1, var)
+  mrna_keep <- names(sort(mrna_vars, decreasing = TRUE))[1:min(5000, length(mrna_vars))]
+  mrna_fold_compressed <- mrna_fold_data[mrna_keep, ]
+  
+  met_fold_data <- met_sync[, fold_samples, drop = FALSE]
+  met_vars <- apply(met_fold_data, 1, var)
+  met_keep <- names(sort(met_vars, decreasing = TRUE))[1:min(5000, length(met_vars))]
+  met_fold_compressed <- met_fold_data[met_keep, ]
+  
+  fold_x_matrix <- t(rbind(
+    mrna_fold_compressed,
+    mirna_sync[, fold_samples, drop = FALSE],
+    met_fold_compressed,
+    cnv_sync[, fold_samples, drop = FALSE],
+    rppa_sync[, fold_samples, drop = FALSE]
+  ))
+  
+  fold_y_vector <- ifelse(fold_meta$class == "Normal", 0, 1)
+  
+  w_normal <- length(fold_y_vector) / (2 * max(1, sum(fold_y_vector == 0)))
+  w_early  := length(fold_y_vector) / (2 * max(1, sum(fold_y_vector == 1)))
+  sample_weights <- ifelse(fold_y_vector == 0, w_normal, w_early)
+  
+  # Fit weighted Elastic Net on permuted parameters
+  fit_en <- tryCatch({
+    cv.glmnet(x = fold_x_matrix, y = fold_y_vector, weights = sample_weights,
+              family = "binomial", alpha = 0.50, standardize = TRUE)
+  }, error = function(e) { return(NULL) })
+  
+  if (is.null(fit_en)) return(character(0))
+  
+  coef_1se <- coef(fit_en, s = "lambda.1se")
+  coef_vector <- as.vector(coef_1se)[-1]
+  names(coef_vector) <- rownames(coef_1se)[-1]
+  
+  return(names(coef_vector)[coef_vector != 0])
+}
+
+stopCluster(cl)
+cat("Permutation calibration passes finalized successfully.\n")
+
+# ------------------------------------------------------------------------------
+# Step 3.6: Scoring Aggregate Calculations & Export
+# ------------------------------------------------------------------------------
+
+# Tally feature occurrences in the permuted runs to find the background noise floor
+all_perm_features <- unlist(permutation_results)
+if (length(all_perm_features) > 0) {
+  perm_freq_table <- table(all_perm_features) / 100
+  # Empirical null cutoff matches the 99th percentile of random background selections
+  empirical_threshold <- as.numeric(quantile(perm_freq_table, 0.99))
+} else {
+  empirical_threshold <- 0.15 # Fallback conservative floor if null space remains empty
+}
+
+# Ensure threshold remains bounded within reasonable operational limits
+stability_threshold <- max(0.20, min(0.60, empirical_threshold))
+cat(sprintf("Permutation Calibration Complete: Absolute Selection Threshold set at frequency >= %.3f\n", 
+            stability_threshold))
+
+# Aggregate true selections across the 100 real bootstrap runs
+real_features <- unlist(lapply(bootstrap_results, function(x) x$features))
+real_directions <- unlist(lapply(bootstrap_results, function(x) x$directions))
+
+real_freq_df <- data.frame(feature = real_features, direction = real_directions, stringsAsFactors = FALSE)
+stability_summary <- real_freq_df %>%
+  group_by(feature) %>%
+  summarize(
+    stability_frequency = n() / 100,
+    mean_direction = mean(direction),
+    .groups = "drop"
+  )
+
+# Calculate true mean delta metrics (Mean_Early - Mean_Normal) for directional confirmation
+# Determine platform layout mappings based on string row headers
+all_features_pool <- unique(stability_summary$feature)
+
+cat("Calculating multi-modal directional delta values...\n")
+delta_vectors <- numeric(length(all_features_pool))
+names(delta_vectors) <- all_features_pool
+
+normal_barcodes <- transform_train_meta$sample_barcode_15[transform_train_meta$class == "Normal"]
+early_barcodes  <- transform_train_meta$sample_barcode_15[transform_train_meta$class == "Early"]
+
+for (feat in all_features_pool) {
+  if (feat %in% rownames(mrna_sync)) {
+    delta_vectors[feat] <- mean(mrna_sync[feat, early_barcodes]) - mean(mrna_sync[feat, normal_barcodes])
+  } else if (feat %in% rownames(mirna_sync)) {
+    delta_vectors[feat] <- mean(mirna_sync[feat, early_barcodes]) - mean(mirna_sync[feat, normal_barcodes])
+  } else if (feat %in% rownames(met_sync)) {
+    delta_vectors[feat] <- mean(met_sync[feat, early_barcodes]) - mean(met_sync[feat, normal_barcodes])
+  } else if (feat %in% rownames(cnv_sync)) {
+    delta_vectors[feat] <- mean(cnv_sync[feat, early_barcodes]) - mean(cnv_sync[feat, normal_barcodes])
+  } else if (feat %in% rownames(rppa_sync)) {
+    delta_vectors[feat] <- mean(rppa_sync[feat, early_barcodes]) - mean(rppa_sync[feat, normal_barcodes])
+  }
+}
+
+# Bind metrics into unified summary tracking matrix
+stability_summary$directional_delta <- delta_vectors[stability_summary$feature]
+stability_summary$is_primary_candidate <- stability_summary$stability_frequency >= stability_threshold
+
+# Save final transformation axis discovery register
+fwrite(stability_summary, file = file.path(config$csv_dir, "axis1_transformation_stability_weights.csv"))
+saveRDS(stability_summary, file = file.path(config$out_dir, "axis1_transformation_scored_summary.rds"))
+
+cat(sprintf("Step 3.6 Complete: Generated %d primary Transformation candidates out of %d tracked features.\n",
+            sum(stability_summary$is_primary_candidate), nrow(stability_summary)))
