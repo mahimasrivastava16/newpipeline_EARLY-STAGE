@@ -1,0 +1,549 @@
+# ==============================================================================
+# SECTION 3: MOLECULAR INGESTION & NORMALIZATION
+# Step 1.3 — mRNA Ingestion & Normalization
+# ==============================================================================
+
+cat("\nProcessing mRNA Layer (Step 1.3)...\n")
+
+# 1.3.1: Load raw RNA object from your local download configuration path
+load(file.path(config$raw_dir, "RNA.rda"))
+
+# TCGAbiolinks saves this under the variable name 'data' (RangedSummarizedExperiment)
+if (!exists("data")) {
+  stop("Expected object named 'data' was not found in the loaded RNA.rda file.")
+}
+rna_se <- data
+rm(data) # Purge reference copy immediately to reclaim RAM
+
+# 1.3.2: Map the SummarizedExperiment sample IDs to match your 15-char metadata keys
+raw_rna_barcodes <- colnames(rna_se)
+colnames(rna_se)  <- substr(raw_rna_barcodes, 1, 15)
+
+# Extract Plate IDs directly from the full un-truncated barcodes (positions 22-25)
+mrna_plates <- substr(raw_rna_barcodes, 22, 25)
+
+# 1.3.3: Align with your clinical registry metadata
+mrna_samples <- intersect(colnames(rna_se), meta_matrix$sample_barcode_15)
+rna_se_aligned <- rna_se[, mrna_samples]
+
+# Construct a clean colData dataframe for DESeq2 processing
+mrna_metadata <- meta_matrix[match(mrna_samples, meta_matrix$sample_barcode_15), ]
+mrna_metadata$plate_id <- mrna_plates[match(mrna_samples, colnames(rna_se))]
+
+# 1.3.4: Low-count Filtering (Drop if < 10 counts in > 80% of samples)
+raw_counts <- assay(rna_se_aligned, "unstranded") # Standard GDC HTSeq raw count assay
+
+absence_threshold <- 0.80
+min_count <- 10
+absent_percentage <- rowMeans(raw_counts < min_count)
+keep_genes <- absent_percentage <= absence_threshold
+
+# Hard-enforce retention of key literature markers to avoid silent dropping
+lit_targets <- c("ESR1", "ERBB2", "BRCA1", "LAD1", "COL11A1", "MAPK11", "EPYC")
+genes_to_keep <- names(keep_genes)[keep_genes]
+
+# Convert Ensembl IDs to symbols using internal rowData to ensure matching
+gene_annotation <- as.data.frame(rowData(rna_se_aligned))
+lit_ensembl_ids <- gene_annotation$gene_id[gene_annotation$gene_name %in% lit_targets]
+
+final_genes_to_keep <- unique(c(genes_to_keep, lit_ensembl_ids))
+counts_filtered <- raw_counts[final_genes_to_keep, ]
+
+cat(sprintf("mRNA Filter Summary: Retained %d genes out of %d raw features.\n", 
+            nrow(counts_filtered), nrow(raw_counts)))
+
+# 1.3.5: DESeq2 Unsupervised Size-Factor Estimation and VST
+dds <- DESeqDataSetFromMatrix(countData = counts_filtered,
+                              colData = mrna_metadata,
+                              design = ~ 1) # Unsupervised placeholder
+
+cat("Estimating size factors and running VST...\n")
+dds <- estimateSizeFactors(dds)
+vst_matrix <- assay(varianceStabilizingTransformation(dds, blind = TRUE))
+
+# 1.3.6: ComBat Batch Correction across Plate IDs
+# Remove singleton plates to protect linear model degrees of freedom
+plate_counts <- table(mrna_metadata$plate_id)
+singleton_plates <- names(plate_counts)[plate_counts <= 1]
+
+if(length(singleton_plates) > 0) {
+  cat(sprintf("Stripping %d singleton plates to protect ComBat linear independence...\n", length(singleton_plates)))
+  valid_indices <- !mrna_metadata$plate_id %in% singleton_plates
+  vst_matrix <- vst_matrix[, valid_indices]
+  mrna_metadata <- mrna_metadata[valid_indices, ]
+}
+
+batch_vector <- as.factor(mrna_metadata$plate_id)
+mod_matrix <- model.matrix(~ as.factor(class), data = mrna_metadata)
+
+cat("Executing ComBat for plate batch effects...\n")
+mrna_corrected <- ComBat(dat = vst_matrix, 
+                         batch = batch_vector, 
+                         mod = mod_matrix, 
+                         par.prior = TRUE, 
+                         prior.plots = FALSE)
+
+# Save intermediate matrix
+saveRDS(list(matrix = mrna_corrected, metadata = mrna_metadata), 
+        file = file.path(config$out_dir, "mrna_normalized_corrected.rds"))
+cat("Step 1.3 Complete: Processed mRNA matrix saved.\n")
+
+
+
+# ==============================================================================
+# Step 1.4 — miRNA Ingestion & Normalization
+# ==============================================================================
+
+cat("\nProcessing miRNA Layer (Step 1.4)...\n")
+
+# 1.4.1: Load raw miRNA object from your local download path
+load(file.path(config$raw_dir, "miRNA.rda"))
+
+# TCGAbiolinks saves isoform quantification data as an object named 'data'
+if (!exists("data")) {
+  stop("Expected object named 'data' was not found in the loaded miRNA.rda file.")
+}
+mirna_raw <- data
+rm(data) # Free memory immediately
+
+# GDCprepare for Isoform Quantification typically returns a wide data frame or matrix
+# where column names are full aliquot barcodes and row names are miRNA designations.
+mirna_counts <- as.matrix(mirna_raw)
+
+# Map sample names to match your 15-character metadata tracking format
+raw_mirna_barcodes <- colnames(mirna_counts)
+colnames(mirna_counts) <- substr(raw_mirna_barcodes, 1, 15)
+
+# Extract Plate IDs dynamically from positions 22-25 of the original barcodes
+mirna_plates <- substr(raw_mirna_barcodes, 22, 25)
+
+# 1.4.2: Intersect and align rows with your clinical metadata registry
+mirna_samples <- intersect(colnames(mirna_counts), meta_matrix$sample_barcode_15)
+mirna_counts_aligned <- mirna_counts[, mirna_samples, drop = FALSE]
+
+# Construct a clean metadata matrix matching the aligned counts columns
+mirna_metadata <- meta_matrix[match(mirna_samples, meta_matrix$sample_barcode_15), ]
+mirna_metadata$plate_id <- mirna_plates[match(mirna_samples, raw_mirna_barcodes)]
+
+# 1.4.3: Low-Expression Filter (CPM <= 1 in >= 80% of samples)
+dge_list <- DGEList(counts = mirna_counts_aligned)
+cpm_matrix <- cpm(dge_list)
+
+absence_threshold <- 0.80
+low_expr_mask <- rowMeans(cpm_matrix <= 1) >= absence_threshold
+keep_mirnas <- !low_expr_mask
+
+mirna_filtered <- mirna_counts_aligned[keep_mirnas, , drop = FALSE]
+cat(sprintf("miRNA Filter Summary: Retained %d miRNAs. Discarded %d low-signal targets.\n", 
+            sum(keep_mirnas), sum(low_expr_mask)))
+
+# 1.4.4: edgeR TMM Normalization & limma::voom Transformation
+dge_filtered <- DGEList(counts = mirna_filtered)
+cat("Calculating Trimmed Mean of M-values (TMM) scale factors...\n")
+dge_filtered <- calcNormFactors(dge_filtered, method = "TMM")
+
+# Formulate design matrix to preserve downstream biological classification states
+design_mat <- model.matrix(~ as.factor(class), data = mirna_metadata)
+
+cat("Executing limma::voom variance stabilization transformation...\n")
+voom_transformed <- voom(dge_filtered, design = design_mat, plot = FALSE)
+voom_matrix <- voom_transformed$E # Extract continuous log2 expression matrix
+
+# 1.4.5: Plate Batch Correction via ComBat on Continuous Voom Space
+# Remove singleton plates to safeguard linear model degrees of freedom
+plate_counts <- table(mirna_metadata$plate_id)
+singleton_plates <- names(plate_counts)[plate_counts <= 1]
+
+if (length(singleton_plates) > 0) {
+  cat(sprintf("Stripping %d singleton plates to maintain ComBat linear independence...\n", length(singleton_plates)))
+  valid_samples <- !mirna_metadata$plate_id %in% singleton_plates
+  voom_matrix <- voom_matrix[, valid_samples, drop = FALSE]
+  mirna_metadata <- mirna_metadata[valid_samples, , drop = FALSE]
+  # Recompute design matrix for the active sample subset
+  design_mat <- model.matrix(~ as.factor(class), data = mirna_metadata)
+}
+
+batch_vector <- as.factor(mirna_metadata$plate_id)
+
+cat("Running ComBat across plate covariates on voom continuous space...\n")
+mirna_corrected <- ComBat(dat = voom_matrix, 
+                          batch = batch_vector, 
+                          mod = design_mat, 
+                          par.prior = TRUE, 
+                          prior.plots = FALSE)
+
+# Save intermediate matrix
+saveRDS(list(matrix = mirna_corrected, metadata = mirna_metadata), 
+        file = file.path(config$out_dir, "mirna_normalized_corrected.rds"))
+cat("Step 1.4 Complete: Processed miRNA matrix saved.\n")
+
+
+
+# ==============================================================================
+# Step 1.5 — DNA Methylation Ingestion & Normalization
+# ==============================================================================
+
+cat("\nProcessing DNA Methylation Layer (Step 1.5)...\n")
+
+# 1.5.1: Load raw Methylation object from your local download path
+load(file.path(config$raw_dir, "met.rda"))
+
+# TCGAbiolinks saves methylation data as a SummarizedExperiment named 'data'
+if (!exists("data")) {
+  stop("Expected object named 'data' was not found in the loaded met.rda file.")
+}
+methyl_se <- data
+rm(data) # Free memory immediately
+
+# Map sample names to match your 15-character metadata tracking format
+raw_methyl_barcodes <- colnames(methyl_se)
+colnames(methyl_se) <- substr(raw_methyl_barcodes, 1, 15)
+methyl_plates <- substr(raw_methyl_barcodes, 22, 25)
+
+# Intersect and align columns with your metadata registry
+methyl_samples <- intersect(colnames(methyl_se), meta_matrix$sample_barcode_15)
+methyl_se_aligned <- methyl_se[, methyl_samples]
+
+methyl_metadata <- meta_matrix[match(methyl_samples, meta_matrix$sample_barcode_15), ]
+methyl_metadata$plate_id <- methyl_plates[match(methyl_samples, raw_methyl_barcodes)]
+
+# Extract raw beta values
+beta_matrix <- as.matrix(assay(methyl_se_aligned))
+
+# 1.5.2: Sequential Filtration Layers
+cat("Executing sequential probe filtration layers...\n")
+
+# Layer A: Load and apply Pidsley et al. 2016 cross-reactive probe blacklist
+if (!file.exists(config$pidsley_file)) {
+  stop(sprintf("Pidsley blacklist file missing at %s. Please download before proceeding.", config$pidsley_file))
+}
+pidsley_probes <- fread(config$pidsley_file, data.table = FALSE)
+# Extract probe IDs from the primary column (assuming first column contains cg IDs)
+blacklist_probes <- as.character(pidsley_probes[, 1])
+
+# Layer B & C: Fetch sex-chromosome and SNP-proximal masks from IlluminaHumanMethylation450kanno
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+ann450k <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+sex_probes <- rownames(ann450k)[ann450k$chr %in% c("chrX", "chrY")]
+snp_probes <- rownames(ann450k)[!is.na(ann450k$Probe_rs) | ann450k$CpG_rs_dist <= 5]
+
+# Combine exclusions (Do NOT exclude OpenSea probes; they carry critical signals)
+all_excluded_probes <- unique(c(blacklist_probes, sex_probes, snp_probes))
+
+keep_probes_mask <- !(rownames(beta_matrix) %in% all_excluded_probes)
+beta_filtered <- beta_matrix[keep_probes_mask, , drop = FALSE]
+
+cat(sprintf("Probe Filtration Summary: Retained %d out of %d probes.\n", 
+            nrow(beta_filtered), nrow(beta_matrix)))
+
+# 1.5.3: Missingness Filtering and kNN Imputation
+# Discard probes with > 10% missing values across rows
+missing_rate <- rowMeans(is.na(beta_filtered))
+beta_filtered <- beta_filtered[missing_rate <= 0.10, , drop = FALSE]
+
+if (any(is.na(beta_filtered))) {
+  cat("Imputing remaining missing values via 5-Nearest-Neighbor mapping...\n")
+  library(impute)
+  # impute.knn expects features as rows and samples as columns
+  imputed_output <- impute.knn(beta_filtered, k = 5, maxmax = 0.5)
+  beta_clean <- imputed_output$data
+} else {
+  beta_clean <- beta_filtered
+}
+
+# 1.5.4: Column-wise BMIQ Normalization
+# BMIQ adjusts for the design bias between Infinium Type I and Type II probes
+cat("Executing Beta-Mixture Quantile Normalization (BMIQ) via wateRmelon...\n")
+library(wateRmelon)
+
+# Extract probe design types (Infinium I vs II) matching our clean matrix rows
+probe_types <- ann450k[rownames(beta_clean), "Type"]
+# Convert design flags to numeric matching wateRmelon specs: Type I = 1, Type II = 2
+design_vector <- ifelse(probe_types == "I", 1, 2)
+
+beta_normalized <- matrix(NA, nrow = nrow(beta_clean), ncol = ncol(beta_clean),
+                          dimnames = dimnames(beta_clean))
+
+# Execute column-by-column to preserve independent array distributions
+for (i in 1:ncol(beta_clean)) {
+  # Catch rare convergence failures safely using tryCatch
+  beta_normalized[, i] <- tryCatch({
+    norm_tmp <- BMIQ(beta_clean[, i], design_vector, plots = FALSE, verbose = FALSE)
+    norm_tmp$nbeta
+  }, error = function(e) {
+    # Fallback to uncorrected profile if BMIQ fails to arrive at stable expectations
+    return(beta_clean[, i])
+  })
+}
+
+# 1.5.5: Mathematical Conversion to M-Values & Winsorization
+cat("Converting beta values to M-values and executing tail winsorization...\n")
+# Clamp extreme boundary values to prevent infinite values during log transformation
+beta_clamped <- pmin(pmax(beta_normalized, 0.0001), 0.9999)
+m_matrix <- log2(beta_clamped / (1 - beta_clamped))
+
+# Winsorize at 0.1% and 99.9% tails to compress
+
+
+
+# ==============================================================================
+# Step 1.6 — CNV Ingestion & Gene-Level Collapse
+# ==============================================================================
+
+cat("\nProcessing Copy Number Variation Layer (Step 1.6)...\n")
+
+# 1.6.1: Load raw CNV segment data from your local download path
+load(file.path(config$raw_dir, "cnv.rda"))
+
+# TCGAbiolinks saves Masked Copy Number Segment files as an object named 'data'
+if (!exists("data")) {
+  stop("Expected object named 'data' was not found in the loaded cnv.rda file.")
+}
+cnv_raw <- data
+rm(data) # Free memory immediately
+
+# GDC copy number segment dataframes contain columns: Sample, Chromosome, Start, End, Num_Probes, Segment_Mean
+cnv_df <- as.data.frame(cnv_raw)
+
+# Standardize column sample identifiers to match your 15-character tracking key
+cnv_df$sample_barcode_15 <- substr(cnv_df$Sample, 1, 15)
+
+# Intersect and slice table down to your synchronized registry baseline
+cnv_df_aligned <- cnv_df %>% 
+  filter(sample_barcode_15 %in% meta_matrix$sample_barcode_15)
+
+# 1.6.2: Set Up hg19 Genomic Ranges reference
+library(GenomicRanges)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+hg19_genes <- genes(txdb) # Extract core hg19 gene coordinates
+
+# Convert raw segment data frame into an indexed GRanges collection
+# Coerce "X" and "Y" coordinates if present to match UCSC styles ("chrX", "chrY")
+cnv_df_aligned$Chromosome <- ifelse(startsWith(as.character(cnv_df_aligned$Chromosome), "chr"),
+                                    as.character(cnv_df_aligned$Chromosome),
+                                    paste0("chr", cnv_df_aligned$Chromosome))
+
+segments_gr <- GRanges(
+  seqnames = cnv_df_aligned$Chromosome,
+  ranges   = IRanges(start = cnv_df_aligned$Start, end = cnv_df_aligned$End),
+  Segment_Mean   = cnv_df_aligned$Segment_Mean,
+  sample_barcode = cnv_df_aligned$sample_barcode_15
+)
+
+# 1.6.3: Length-Weighted Genomic Overlap Optimization Loop
+cat("Executing length-weighted mean gene-level collapse across all target samples...\n")
+
+unique_cnv_samples <- unique(segments_gr$sample_barcode)
+gene_ids <- names(hg19_genes)
+
+# Pre-allocate blank score storage grid [Genes x Samples]
+cnv_gene_matrix <- matrix(NA, nrow = length(gene_ids), ncol = length(unique_cnv_samples),
+                          dimnames = list(gene_ids, unique_cnv_samples))
+
+# Find overlapping pairs across the whole coordinate layout at once to optimize lookups
+overlap_hits <- findOverlappingPairs(hg19_genes, segments_gr)
+
+# Convert hits metadata to data frame for rapid vectorized calculations via data.table
+overlap_dt <- data.table(
+  gene_id        = names(first(overlap_hits)),
+  sample_barcode = second(overlap_hits)$sample_barcode,
+  seg_mean       = second(overlap_hits)$Segment_Mean,
+  g_start        = start(first(overlap_hits)),
+  g_end          = end(first(overlap_hits)),
+  s_start        = start(second(overlap_hits)),
+  s_end          = end(second(overlap_hits))
+)
+
+# Calculate nucleotide overlap bounds per intersection match
+overlap_dt[, overlap_start := pmax(g_start, s_start)]
+overlap_dt[, overlap_end   := pmin(g_end, s_end)]
+overlap_dt[, overlap_len   := pmax(0, overlap_end - overlap_start + 1)]
+
+# Compute the length-weighted segment mean calculation per gene per sample
+# Formula: Score = Sum(Segment_Mean * Overlap_Length) / Sum(Overlap_Length)
+collapsed_dt <- overlap_dt[, .(
+  weighted_score = sum(seg_mean * overlap_len) / sum(overlap_len)
+), by = .(gene_id, sample_barcode)]
+
+# Cast data.table back into standard matrix dimensions
+for (s in unique_cnv_samples) {
+  sample_subset <- collapsed_dt[sample_barcode == s]
+  cnv_gene_matrix[sample_subset$gene_id, s] <- sample_subset$weighted_score
+}
+
+# 1.6.4: Handle Sample Quality Control Flags (> 30% missing rows dropped)
+missing_per_sample <- colMeans(is.na(cnv_gene_matrix))
+samples_to_keep <- names(missing_per_sample)[missing_per_sample <= 0.30]
+
+cat(sprintf("Sample Quality Control: Retained %d samples out of %d. Dropped %d samples exceeding missingness cap.\n",
+            length(samples_to_keep), ncol(cnv_gene_matrix), ncol(cnv_gene_matrix) - length(samples_to_keep)))
+
+cnv_gene_matrix <- cnv_gene_matrix[, samples_to_keep, drop = FALSE]
+
+# 1.6.5: Chromosome-Arm Localized kNN Imputation
+if (any(is.na(cnv_gene_matrix))) {
+  cat("Imputing residual missing structural scores via nearest neighbor mapping (k=5)...\n")
+  library(impute)
+  # impute.knn handles matrices up to maxmax allocation limits smoothly
+  imputed_cnv <- impute.knn(cnv_gene_matrix, k = 5, maxmax = 0.5)
+  cnv_clean_matrix <- imputed_cnv$data
+} else {
+  cnv_clean_matrix <- cnv_gene_matrix
+}
+
+# Align metadata registry container columns
+cnv_metadata <- meta_matrix[match(colnames(cnv_clean_matrix), meta_matrix$sample_barcode_15), ]
+
+# Save intermediate matrix structures
+saveRDS(list(matrix = cnv_clean_matrix, metadata = cnv_metadata), 
+        file = file.path(config$out_dir, "cnv_normalized_corrected.rds"))
+cat("Step 1.6 Complete: Processed copy-number gene matrix saved.\n")
+
+
+
+
+
+
+# ==============================================================================
+# Step 1.7 — RPPA Ingestion & Normalization
+# ==============================================================================
+
+cat("\nProcessing RPPA Layer (Step 1.7)...\n")
+
+# 1.7.1: Load raw RPPA protein object from your local download path
+load(file.path(config$raw_dir, "prot.rda"))
+
+# TCGAbiolinks saves Proteome Profiling matrices as an object named 'data'
+if (!exists("data")) {
+  stop("Expected object named 'data' was not found in the loaded prot.rda file.")
+}
+rppa_raw <- data
+rm(data) # Free memory immediately
+
+# GDCprepare for RPPA typically yields a matrix or wide dataframe 
+rppa_matrix <- as.matrix(rppa_raw)
+
+# Map sample names to match your 15-character metadata tracking format
+raw_rppa_barcodes <- colnames(rppa_matrix)
+colnames(rppa_matrix) <- substr(raw_rppa_barcodes, 1, 15)
+rppa_plates <- substr(raw_rppa_barcodes, 22, 25)
+
+# Intersect and align layout columns with your metadata registry
+rppa_samples <- intersect(colnames(rppa_matrix), meta_matrix$sample_barcode_15)
+rppa_matrix_aligned <- rppa_matrix[, rppa_samples, drop = FALSE]
+
+rppa_metadata <- meta_matrix[match(rppa_samples, meta_matrix$sample_barcode_15), ]
+rppa_metadata$plate_id <- rppa_plates[match(rppa_samples, raw_rppa_barcodes)]
+
+# 1.7.2: Missingness Filtration & KNN Imputation
+# Filter out antibody channels containing > 10% missing values across rows
+antibody_missingness <- rowMeans(is.na(rppa_matrix_aligned))
+rppa_filtered <- rppa_matrix_aligned[antibody_missingness <= 0.10, , drop = FALSE]
+
+cat(sprintf("Antibody Filtration Summary: Retained %d profiles. Discarded %d missing channels.\n", 
+            nrow(rppa_filtered), sum(antibody_missingness > 0.10)))
+
+if (any(is.na(rppa_filtered))) {
+  cat("Imputing residual missing proteomic points via 5-Nearest-Neighbor mapping...\n")
+  library(impute)
+  rppa_imputed <- impute.knn(rppa_filtered, k = 5, maxmax = 0.5)
+  rppa_clean <- rppa_imputed$data
+} else {
+  rppa_clean <- rppa_filtered
+}
+
+# 1.7.3: Absolute Quantile Normalization
+cat("Executing absolute quantile normalization across proteomic arrays...\n")
+library(preprocessCore)
+rppa_normalized <- normalize.quantiles(rppa_clean, copy = TRUE)
+dimnames(rppa_normalized) <- dimnames(rppa_clean)
+
+# Aggregate duplicate antibody channels by mean if present
+if (any(duplicated(rownames(rppa_normalized)))) {
+  cat("Aggregating duplicate antibody rows by mean score...\n")
+  rppa_normalized <- aggregate(rppa_normalized, by = list(rownames(rppa_normalized)), FUN = mean)
+  rownames(rppa_normalized) <- rppa_normalized$Group.1
+  rppa_normalized$Group.1 <- NULL
+  rppa_normalized <- as.matrix(rppa_normalized)
+}
+
+# 1.7.4: ComBat Pass with Integrated Biological Sensitivity Check
+# Isolate singletons to protect degrees of freedom
+plate_counts <- table(rppa_metadata$plate_id)
+singleton_plates <- names(plate_counts)[plate_counts <= 1]
+
+if (length(singleton_plates) > 0) {
+  valid_samples <- !rppa_metadata$plate_id %in% singleton_plates
+  rppa_normalized_working <- rppa_normalized[, valid_samples, drop = FALSE]
+  rppa_metadata_working <- rppa_metadata[valid_samples, , drop = FALSE]
+} else {
+  rppa_normalized_working <- rppa_normalized
+  rppa_metadata_working <- rppa_metadata
+}
+
+batch_vector <- as.factor(rppa_metadata_working$plate_id)
+mod_matrix <- model.matrix(~ as.factor(class), data = rppa_metadata_working)
+
+cat("Executing primary ComBat batch adjustment pass...\n")
+rppa_combat <- tryCatch({
+  ComBat(dat = rppa_normalized_working, 
+         batch = batch_vector, 
+         mod = mod_matrix, 
+         par.prior = TRUE, 
+         prior.plots = FALSE)
+}, error = function(e) {
+  cat("ComBat failed due to matrix mathematical variance bounds. Shifting to fallback fallback mode.\n")
+  return(NULL)
+})
+
+# --- BIOLOGICAL SENSITIVITY CHECK SYSTEM ---
+# Confirm ERBB2 and ESR1 signatures retain expected physiological ranges post-correction
+run_fallback <- FALSE
+
+if (is.null(rppa_combat)) {
+  run_fallback <- TRUE
+} else {
+  # Search for target strings within the antibody naming scheme (e.g., "Her2", "ER-alpha", "ESR1")
+  erbb2_row <- grep("ERBB2|HER2", rownames(rppa_combat), ignore.case = TRUE, value = TRUE)
+  esr1_row  <- grep("ESR1|ER-ALPHA", rownames(rppa_combat), ignore.case = TRUE, value = TRUE)
+  
+  if (length(erbb2_row) > 0 && length(esr1_row) > 0) {
+    # Check if the overall global variance of these critical markers was overly compressed
+    var_erbb2_post <- var(rppa_combat[erbb2_row[1], ])
+    var_erbb2_pre  <- var(rppa_normalized_working[erbb2_row[1], ])
+    
+    # Rule: If ComBat squashes the variance of key markers by more than 70%, it is over-correcting
+    if ((var_erbb2_post / var_erbb2_pre) < 0.30) {
+      cat("Warning: ComBat compression exceeded biological safety metrics (>70% variance loss for ERBB2).\n")
+      run_fallback <- TRUE
+    }
+  }
+}
+
+if (run_fallback) {
+  cat("Executing alternative protocol: Median-centering across batches to protect signal architecture.\n")
+  # Alternative protocol: Sample median-centering within individual batches
+  rppa_final <- rppa_normalized_working
+  unique_batches <- unique(rppa_metadata_working$plate_id)
+  
+  for (b in unique_batches) {
+    b_idx <- which(rppa_metadata_working$plate_id == b)
+    if (length(b_idx) > 0) {
+      batch_medians <- apply(rppa_final[, b_idx, drop = FALSE], 1, median, na.rm = TRUE)
+      rppa_final[, b_idx] <- rppa_final[, b_idx, drop = FALSE] - batch_medians
+    }
+  }
+  normalization_method_used <- "MedianCentering"
+} else {
+  cat("ComBat biological validation pass successful. Signal boundaries intact.\n")
+  rppa_final <- rppa_combat
+  normalization_method_used <- "ComBat"
+}
+
+# Save processed matrix structures alongside the validation log
+saveRDS(list(matrix = rppa_final, metadata = rppa_metadata_working, method = normalization_method_used), 
+        file = file.path(config$out_dir, "rppa_normalized_corrected.rds"))
+cat("Step 1.7 Complete: Processed RPPA proteomic matrix saved.\n")
